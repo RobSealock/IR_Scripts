@@ -1,0 +1,295 @@
+function Get-FirewallModificationTimeline {
+    [CmdletBinding()]
+    param()
+
+    Write-Host ""
+    Write-Host "=== Firewall Modification Timeline (Interactive Mode) ===" -ForegroundColor Cyan
+    Write-Host ""
+
+    # === Interactive Prompts ===
+
+    # Max events
+    $maxEventsInput = Read-Host "Enter max number of firewall events to collect [default 200]"
+    if ([string]::IsNullOrWhiteSpace($maxEventsInput)) {
+        $MaxEvents = 200
+    } else {
+        $MaxEvents = [int]$maxEventsInput
+    }
+
+    # Suspicious days
+    $suspDaysInput = Read-Host "Enter suspicious-day window [default 7]"
+    if ([string]::IsNullOrWhiteSpace($suspDaysInput)) {
+        $SuspiciousDays = 7
+    } else {
+        $SuspiciousDays = [int]$suspDaysInput
+    }
+
+    # CSV export
+    $csvChoice = Read-Host "Generate CSV report? (Y/N)"
+    if ($csvChoice -match '^[Yy]$') {
+        $csvPathInput = Read-Host "Enter CSV output path [default C:\IR\FirewallTimeline.csv]"
+        if ([string]::IsNullOrWhiteSpace($csvPathInput)) {
+            $OutputCsvPath = "C:\IR\FirewallTimeline.csv"
+        } else {
+            $OutputCsvPath = $csvPathInput
+        }
+    }
+
+    # HTML export
+    $htmlChoice = Read-Host "Generate HTML report? (Y/N)"
+    if ($htmlChoice -match '^[Yy]$') {
+        $htmlPathInput = Read-Host "Enter HTML output path [default C:\IR\FirewallTimeline.html]"
+        if ([string]::IsNullOrWhiteSpace($htmlPathInput)) {
+            $OutputHtmlPath = "C:\IR\FirewallTimeline.html"
+        } else {
+            $OutputHtmlPath = $htmlPathInput
+        }
+    }
+
+    Write-Host ""
+    Write-Host "Collecting data..." -ForegroundColor Yellow
+    Write-Host ""
+
+    # === Helper: Create timeline record ===
+    function New-TimelineRecord {
+        param(
+            [string]$Source,
+            [string]$Category,
+            [datetime]$Time,
+            [string]$Detail,
+            [string]$Risk = "Info",
+            [bool]$Suspicious = $false
+        )
+        New-Object PSObject -Property @{
+            Source     = $Source
+            Category   = $Category
+            Time       = $Time
+            Detail     = $Detail
+            Risk       = $Risk
+            Suspicious = $Suspicious
+        }
+    }
+
+    # === Event Log Collection ===
+    function Get-FirewallEventData {
+        param($MaxEventsInner, $SuspiciousDaysInner)
+
+        $timeline = @()
+        $cutoff = (Get-Date).AddDays(-1 * $SuspiciousDaysInner)
+        $logName = "Microsoft-Windows-Windows Firewall With Advanced Security/Firewall"
+        $eventIds = 2004,2005,2006,2031,2033
+
+        try {
+            $events = Get-WinEvent -LogName $logName -ErrorAction Stop |
+                      Where-Object { $eventIds -contains $_.Id } |
+                      Sort-Object TimeCreated -Descending |
+                      Select-Object -First $MaxEventsInner
+        }
+        catch {
+            Write-Warning "Failed to read firewall event log: $($_.Exception.Message)"
+            return $timeline
+        }
+
+        foreach ($evt in $events) {
+            $risk = "Info"
+            $category = "Event"
+
+            switch ($evt.Id) {
+                2004 { $category = "RuleAdded";    $risk = "Medium" }
+                2005 { $category = "RuleModified"; $risk = "Medium" }
+                2006 { $category = "RuleDeleted";  $risk = "Low"    }
+                2031 { $category = "SettingsRestored"; $risk = "Medium" }
+                2033 { $category = "PolicyChanged";    $risk = "High"   }
+            }
+
+            $suspicious = ($evt.TimeCreated -ge $cutoff -and $risk -in @("High","Medium"))
+
+            $timeline += New-TimelineRecord -Source "EventLog" -Category $category `
+                        -Time $evt.TimeCreated -Detail $evt.Message -Risk $risk -Suspicious $suspicious
+        }
+
+        return $timeline
+    }
+
+    # === Registry LastWriteTime ===
+    function Get-FirewallRegistryData {
+        param($SuspiciousDaysInner)
+
+        $timeline = @()
+        $cutoff = (Get-Date).AddDays(-1 * $SuspiciousDaysInner)
+        $basePath = "HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy"
+
+        try {
+            $profiles = Get-ChildItem -Path $basePath -ErrorAction Stop
+        }
+        catch {
+            Write-Warning "Failed to read firewall registry keys: $($_.Exception.Message)"
+            return $timeline
+        }
+
+        foreach ($p in $profiles) {
+            $lw = $p.LastWriteTime
+            if (-not $lw) { continue }
+
+            $risk = "Info"
+            $suspicious = $lw -ge $cutoff
+
+            if ($suspicious) { $risk = "Medium" }
+
+            $timeline += New-TimelineRecord -Source "Registry" -Category "ProfileLastWrite" `
+                        -Time $lw -Detail "Profile '$($p.PSChildName)' LastWriteTime: $lw" `
+                        -Risk $risk -Suspicious $suspicious
+        }
+
+        return $timeline
+    }
+
+    # === Firewall Policy File Timestamps ===
+    function Get-FirewallPolicyFileData {
+        param($SuspiciousDaysInner)
+
+        $timeline = @()
+        $cutoff = (Get-Date).AddDays(-1 * $SuspiciousDaysInner)
+        $paths = @(
+            "$env:SystemRoot\System32\FirewallPolicy.xml",
+            "$env:SystemRoot\System32\FirewallRules"
+        )
+
+        foreach ($path in $paths) {
+            try {
+                $item = Get-Item -Path $path -ErrorAction Stop
+            }
+            catch { continue }
+
+            $lw = $item.LastWriteTime
+            $suspicious = $lw -ge $cutoff
+            if ($suspicious) { $risk = "Medium" } else { $risk = "Info" }
+            $timeline += New-TimelineRecord -Source "FileSystem" -Category "PolicyFile" `
+                        -Time $lw -Detail "File '$($item.FullName)' LastWriteTime: $lw" `
+                        -Risk $risk -Suspicious $suspicious
+        }
+
+        return $timeline
+    }
+
+    # === GPO Last Applied Time ===
+    function Get-GpoApplyTimeData {
+        param($SuspiciousDaysInner)
+
+        $timeline = @()
+        $cutoff = (Get-Date).AddDays(-1 * $SuspiciousDaysInner)
+
+        try {
+            $output = gpresult /r /scope computer 2>$null
+        }
+        catch {
+            Write-Warning "Failed to run gpresult: $($_.Exception.Message)"
+            return $timeline
+        }
+
+        $applyLine = $output | Where-Object { $_ -match "Last time Group Policy was applied" }
+        if (-not $applyLine) { return $timeline }
+
+        $raw = ($applyLine -replace ".*applied:\s*", "").Trim()
+        $raw = $raw -replace "\sat\s", " "
+
+        $dateTime = $null
+        [void][datetime]::TryParse($raw, [ref]$dateTime)
+
+        if ($dateTime) {
+            $suspicious = $dateTime -ge $cutoff
+            if ($suspicious) { $risk = "Medium" } else { $risk = "Info" }
+            $timeline += New-TimelineRecord -Source "GPO" -Category "GpoApplied" `
+                        -Time $dateTime -Detail "GPO applied: $dateTime" `
+                        -Risk $risk -Suspicious $suspicious
+        }
+
+        return $timeline
+    }
+
+    # === Firewall Rule Risk Scoring ===
+    function Get-FirewallRuleRiskData {
+        param($SuspiciousDaysInner)
+
+        $timeline = @()
+
+        try {
+            $rules = Get-NetFirewallRule -ErrorAction Stop | Where-Object { $_.Enabled -eq "True" }
+        }
+        catch {
+            Write-Warning "Failed to query firewall rules: $($_.Exception.Message)"
+            return $timeline
+        }
+
+        foreach ($rule in $rules) {
+            $ports = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $rule -ErrorAction SilentlyContinue
+            $addrs = Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $rule -ErrorAction SilentlyContinue
+
+            $localPort  = ($ports.LocalPort  | Select-Object -First 1)  -or "Any"
+            $remotePort = ($ports.RemotePort | Select-Object -First 1)  -or "Any"
+            $remoteAddr = ($addrs.RemoteAddress | Select-Object -First 1) -or "Any"
+            $protocol   = ($ports.Protocol | Select-Object -First 1) -or "Any"
+
+            $risk = "Low"
+
+            if ($rule.Action -eq "Allow" -and $rule.Direction -eq "Inbound") {
+                if ($remoteAddr -eq "Any" -and $localPort -eq "Any") {
+                    $risk = "High"
+                } elseif ($remoteAddr -eq "Any") {
+                    $risk = "Medium"
+                } else {
+                    $risk = "Medium"
+                }
+            }
+
+            $suspicious = ($risk -eq "High")
+
+            $detail = "Rule '$($rule.DisplayName)' Dir=$($rule.Direction) Action=$($rule.Action) Proto=$protocol LocalPort=$localPort RemotePort=$remotePort RemoteAddr=$remoteAddr"
+
+            $timeline += New-TimelineRecord -Source "FirewallRule" -Category "RuleRisk" `
+                        -Time (Get-Date) -Detail $detail -Risk $risk -Suspicious $suspicious
+        }
+
+        return $timeline
+    }
+
+    # === Collect all data ===
+    $all = @()
+    $all += Get-FirewallEventData      -MaxEventsInner $MaxEvents -SuspiciousDaysInner $SuspiciousDays
+    $all += Get-FirewallRegistryData   -SuspiciousDaysInner $SuspiciousDays
+    $all += Get-FirewallPolicyFileData -SuspiciousDaysInner $SuspiciousDays
+    $all += Get-GpoApplyTimeData       -SuspiciousDaysInner $SuspiciousDays
+    $all += Get-FirewallRuleRiskData   -SuspiciousDaysInner $SuspiciousDays
+
+    $all = $all | Sort-Object Time -Descending
+
+    # === Export CSV ===
+    if ($OutputCsvPath) {
+        try {
+            $all | Export-Csv -Path $OutputCsvPath -NoTypeInformation -Encoding UTF8
+            Write-Host "CSV report saved to $OutputCsvPath" -ForegroundColor Green
+        }
+        catch {
+            Write-Warning "Failed to write CSV: $($_.Exception.Message)"
+        }
+    }
+
+    # === Export HTML ===
+    if ($OutputHtmlPath) {
+        try {
+            $html = $all | ConvertTo-Html -Title "Firewall Modification Timeline" `
+                    -PreContent "<h1>Firewall Modification Timeline</h1>"
+            $html | Out-File -FilePath $OutputHtmlPath -Encoding UTF8
+            Write-Host "HTML report saved to $OutputHtmlPath" -ForegroundColor Green
+        }
+        catch {
+            Write-Warning "Failed to write HTML: $($_.Exception.Message)"
+        }
+    }
+
+    Write-Host ""
+    Write-Host "Timeline collection complete." -ForegroundColor Cyan
+    Write-Host ""
+
+    return $all
+}

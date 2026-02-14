@@ -1,0 +1,140 @@
+# Generate-OSBaseline.ps1
+<#+
+.SYNOPSIS
+    Generate a host baseline JSON snapshot.
+
+.PARAMETER AllProfiles
+    Opt-in. Load and scan all local user profile hives for HKU Run/RunOnce keys.
+
+.PARAMETER ResolveNetworkPaths
+    Opt-in. Attempt to resolve UNC and mapped-drive paths (may hang if unreachable).
+
+.PARAMETER Firefox
+    Opt-in. Enumerate Firefox profile extensions.
+#>
+
+param(
+    [string]$OutputDir = 'C:\Temp\Scan\Ref\',
+    [ValidateSet('Auto','Server','Desktop')]
+    [string]$Profile   = 'Auto',
+
+    # Opt-in: scan Run/RunOnce for ALL local profiles by loading user hives (admin required).
+    [switch]$AllProfiles,
+
+    # Opt-in: allow Normalize-PathSafe to resolve UNC / mapped drives (may hang if unreachable).
+    [switch]$ResolveNetworkPaths,
+
+    # Opt-in: also enumerate Firefox profiles/extensions.
+    [switch]$Firefox
+)
+
+Set-StrictMode -Version Latest
+
+Import-Module "$PSScriptRoot\WinHostBaselineCore.psm1" -ErrorAction Stop
+Import-Module "$PSScriptRoot\WinHostBaseline.Collectors.psm1" -ErrorAction Stop
+
+Set-WinHostBaselineOptions -ResolveNetworkPaths:$ResolveNetworkPaths
+
+function Get-OSProfile {
+    param([string]$Profile)
+    if ($Profile -ne 'Auto') { return $Profile }
+    $os = Get-CimInstance Win32_OperatingSystem
+    if ($os.Caption -match 'Server') { return 'Server' }
+    return 'Desktop'
+}
+
+function Get-OSBaselineName {
+    $os   = Get-CimInstance Win32_OperatingSystem
+    $cv   = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+    $ubr  = $cv.UBR
+    $ver  = $os.Version
+    $prod = $os.Caption
+    $host = $env:COMPUTERNAME
+
+    if ($prod -match 'Windows 11')          { return "Win11_${ver}_$ubr_$host" }
+    if ($prod -match 'Windows Server 2022') { return "Server2022_${ver}_$ubr_$host" }
+    if ($prod -match 'Windows Server 2025') { return "Server2025_${ver}_$ubr_$host" }
+
+    return "$($prod -replace '\s','_')_${ver}_$ubr_$host"
+}
+
+function Ensure-Directory {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    }
+}
+
+function Invoke-Collector {
+    param(
+        [string]$Name,
+        [scriptblock]$Block,
+        [ref]$Errors
+    )
+    try {
+        $res = & $Block
+        if ($null -eq $res) { return @() }
+        return @($res)
+    } catch {
+        $Errors.Value += [pscustomobject]@{
+            Collector = $Name
+            Error     = $_.Exception.Message
+        }
+        return @()
+    }
+}
+
+$profile      = Get-OSProfile $Profile
+$baselineName = Get-OSBaselineName
+
+Ensure-Directory $OutputDir
+
+Write-Host "[*] Generating baseline: $baselineName (Profile: $profile)"
+Write-Host "[*] NOTE: Network sockets baseline defaults to LISTEN-only (low noise)."
+
+$collectorErrors = @()
+
+$services = Invoke-Collector 'Services'  { Get-ServicesHostItems }         ([ref]$collectorErrors)
+$drivers  = Invoke-Collector 'Drivers'   { Get-DriversHostItems }          ([ref]$collectorErrors)
+$procs    = Invoke-Collector 'Processes' { Get-ProcessesHostItems }        ([ref]$collectorErrors)
+$tasks    = Invoke-Collector 'Tasks'     { Get-ScheduledTasksHostItems }   ([ref]$collectorErrors)
+$startup  = Invoke-Collector 'Startup'   { Get-StartupHostItems -AllProfiles:$AllProfiles } ([ref]$collectorErrors)
+$sockets  = Invoke-Collector 'Sockets'   { Get-NetworkSocketsHostItems }   ([ref]$collectorErrors)
+$browser  = Invoke-Collector 'Browser'   { Get-BrowserExtensionsHostItems -Firefox:$Firefox } ([ref]$collectorErrors)
+$wmi      = Invoke-Collector 'WMI'       { Get-WmiPersistenceHostItems }   ([ref]$collectorErrors)
+
+# Optional/extended collectors - include only if present in module
+# (kept minimal in this build; add more as needed)
+# $com     = Invoke-Collector 'COM'      { Get-COMHostItems }      ([ref]$collectorErrors)
+# $lsa     = Invoke-Collector 'LSA'      { Get-LSAHostItems }      ([ref]$collectorErrors)
+# $winsock = Invoke-Collector 'Winsock'  { Get-WinsockHostItems }  ([ref]$collectorErrors)
+
+$baseline = [pscustomobject]@{
+    Meta = @{
+        SchemaVersion   = 2
+        CollectedAtUtc  = (Get-Date).ToUniversalTime().ToString('o')
+        ComputerName    = $env:COMPUTERNAME
+        OS              = (Get-CimInstance Win32_OperatingSystem).Caption
+        Version         = (Get-CimInstance Win32_OperatingSystem).Version
+        BaselineName    = $baselineName
+        Profile         = $profile
+        CollectorErrors = $collectorErrors
+        Options         = @{ AllProfiles = [bool]$AllProfiles; ResolveNetworkPaths = [bool]$ResolveNetworkPaths; Firefox = [bool]$Firefox }
+    }
+    Services          = $services | ForEach-Object { Normalize-HostItem $_ }
+    Drivers           = $drivers  | ForEach-Object { Normalize-HostItem $_ }
+    Processes         = $procs    | ForEach-Object { Normalize-HostItem $_ }
+    ScheduledTasks    = $tasks    | ForEach-Object { Normalize-HostItem $_ }
+    Startup           = $startup  | ForEach-Object { Normalize-HostItem $_ }
+    NetworkSockets    = $sockets  | ForEach-Object { Normalize-HostItem $_ }
+    WmiPersistence    = $wmi      | ForEach-Object { Normalize-HostItem $_ }
+    BrowserExtensions = $browser  | ForEach-Object { Normalize-HostItem $_ }
+}
+
+$outFile = Join-Path $OutputDir "$baselineName.json"
+$baseline | ConvertTo-Json -Depth 16 | Out-File $outFile -Encoding UTF8
+
+Write-Host "[+] Baseline written to: $outFile"
+if ($collectorErrors.Count -gt 0) {
+    Write-Host "[!] Collector warnings/errors were recorded in Meta.CollectorErrors" -ForegroundColor Yellow
+}

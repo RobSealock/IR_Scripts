@@ -1,0 +1,501 @@
+<# 
+Invoke-IRDC Triage.ps1 (PowerShell 5.1)
+DC-focused additions:
+- Domain group membership changes (4728/4729/4732/4733/4756/4757)
+- DCSync-style indicator (4662 w/ DS-Replication-Get-Changes / ...All / ...In-Filtered-Set GUIDs)
+- Same HTML summary + optional verbose section
+
+Run elevated for best log access.
+#>
+
+[CmdletBinding()]
+param()
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'SilentlyContinue'
+
+# -----------------------
+# Prompts
+# -----------------------
+$HoursBack = Read-Host "Lookback window in hours (default 168 = 7 days)"
+if ([string]::IsNullOrWhiteSpace($HoursBack)) { $HoursBack = 168 }
+$HoursBack = [int]$HoursBack
+$StartTime = (Get-Date).AddHours(-1 * $HoursBack)
+
+$VerboseChoice = Read-Host "Include VERBOSE details for all DETECTED items? (Y/N) [N]"
+$IncludeVerbose = ($VerboseChoice -match '^[Yy]$')
+
+$OutPath = Read-Host "HTML output path (default C:\IR\IR-DC-Triage.html)"
+if ([string]::IsNullOrWhiteSpace($OutPath)) { $OutPath = "C:\IR\IR-DC-Triage.html" }
+
+# Ensure directory
+try {
+  $dir = Split-Path -Parent $OutPath
+  if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+} catch {}
+
+# -----------------------
+# Helpers
+# -----------------------
+function Test-LogAvailable {
+  param([Parameter(Mandatory)] [string]$LogName)
+  try { Get-WinEvent -ListLog $LogName -ErrorAction Stop | Out-Null; return $true } catch { return $false }
+}
+
+function Get-EvtData {
+  param([Parameter(Mandatory)] $Event)
+  try {
+    $xml = [xml]$Event.ToXml()
+    $d = @{}
+    foreach ($n in $xml.Event.EventData.Data) {
+      if ($n.Name) { $d[$n.Name] = [string]$n.'#text' }
+    }
+    return $d
+  } catch { return @{} }
+}
+
+function Get-EventsSafe {
+  param(
+    [Parameter(Mandatory)] [string]$LogName,
+    [int[]] $Ids,
+    [datetime] $StartTime
+  )
+  if (-not (Test-LogAvailable -LogName $LogName)) { return @() }
+
+  $fh = @{ LogName = $LogName }
+  if ($Ids -and $Ids.Count -gt 0) { $fh.Id = $Ids }
+  if ($StartTime) { $fh.StartTime = $StartTime }
+
+  try { return @(Get-WinEvent -FilterHashtable $fh -ErrorAction Stop) } catch { return @() }
+}
+
+function New-ResultRow {
+  param(
+    [Parameter(Mandatory)][string]$Tactic,
+    [Parameter(Mandatory)][string]$Detected, # Yes/No
+    [datetime]$LastSeen,
+    [string]$Notes,
+    [object[]]$Events
+  )
+  [pscustomobject]@{
+    Tactic   = $Tactic
+    Detected = $Detected
+    LastSeen = $LastSeen
+    Notes    = $Notes
+    Events   = $Events
+  }
+}
+
+function Select-LastSeen {
+  param([object[]]$Events)
+  if (-not $Events -or $Events.Count -lt 1) { return $null }
+  return ($Events | Sort-Object TimeCreated -Descending | Select-Object -First 1).TimeCreated
+}
+
+function HtmlEncode {
+  param([string]$s)
+  if ($null -eq $s) { return "" }
+  return [System.Net.WebUtility]::HtmlEncode($s)
+}
+
+function EventToBrief {
+  param([Parameter(Mandatory)]$e, [string]$LogName)
+  $msg = ""
+  try { $msg = $e.Message } catch { $msg = "" }
+  if ($msg.Length -gt 400) { $msg = $msg.Substring(0,400) + "..." }
+  [pscustomobject]@{
+    TimeCreated = $e.TimeCreated
+    Log        = $LogName
+    Id         = $e.Id
+    Provider   = $e.ProviderName
+    Message    = $msg
+  }
+}
+
+# -----------------------
+# Detections (DC)
+# -----------------------
+
+function Detect-InitialAccess {
+  $notes = @()
+  $evts = @()
+
+  # DCs still benefit from 4688 & PowerShell Operational if enabled
+  $sec4688 = Get-EventsSafe -LogName "Security" -Ids @(4688) -StartTime $StartTime
+  if ($sec4688.Count -gt 0) {
+    $sus = @()
+    foreach ($e in $sec4688) {
+      $d = Get-EvtData $e
+      $np = ($d["NewProcessName"] + "").ToLower()
+      $pp = ($d["ParentProcessName"] + "").ToLower()
+      $cl = ($d["CommandLine"] + "")
+      if ($pp -match '(services|svchost|lsass)\.exe' -and $np -match '(powershell|cmd|wscript|cscript|rundll32|regsvr32|mshta)\.exe') { $sus += $e; continue }
+      if ($np -match '(powershell|mshta|rundll32|regsvr32)\.exe' -and $cl -match '(http|https|\.downloadstring|frombase64string|iex|invoke-)') { $sus += $e; continue }
+    }
+    if ($sus.Count -gt 0) {
+      $notes += "Suspicious process lineage/commandline patterns in 4688."
+      $evts += ($sus | ForEach-Object { EventToBrief $_ "Security" })
+    } else {
+      $notes += "4688 present; no high-confidence lineage patterns matched."
+    }
+  } else {
+    $notes += "No 4688 telemetry (Audit Process Creation may be off)."
+  }
+
+  $psLog = "Microsoft-Windows-PowerShell/Operational"
+  if (Test-LogAvailable $psLog) {
+    $ps4104 = Get-EventsSafe -LogName $psLog -Ids @(4104) -StartTime $StartTime
+    $hit = $ps4104 | Where-Object { $_.Message -match '(FromBase64String|EncodedCommand|\biex\b|Invoke-WebRequest|DownloadString|AmsiUtils)' }
+    if ($hit.Count -gt 0) {
+      $notes += "PowerShell script block logging shows suspicious strings."
+      $evts += ($hit | Select-Object -First 30 | ForEach-Object { EventToBrief $_ $psLog })
+    } else {
+      $notes += "4104 present; no suspicious keywords matched."
+    }
+  } else {
+    $notes += "PowerShell Operational log not available."
+  }
+
+  $detected = ($evts.Count -gt 0) ? "Yes" : "No"
+  return New-ResultRow -Tactic "Initial Access (partial: lineage + PowerShell)" -Detected $detected -LastSeen (Select-LastSeen $evts) -Notes ($notes -join " ") -Events $evts
+}
+
+function Detect-Execution {
+  $notes = @()
+  $evts = @()
+
+  $sec4688 = Get-EventsSafe -LogName "Security" -Ids @(4688) -StartTime $StartTime
+  if ($sec4688.Count -gt 0) {
+    $sus = @()
+    foreach ($e in $sec4688) {
+      $d = Get-EvtData $e
+      $np = ($d["NewProcessName"] + "").ToLower()
+      $cl = ($d["CommandLine"] + "")
+      if ($np -match '(powershell|cmd|wscript|cscript|mshta|rundll32|regsvr32)\.exe' -and $cl -match '(encodedcommand|frombase64string|downloadstring|http|https|\biex\b)') { $sus += $e }
+    }
+    if ($sus.Count -gt 0) {
+      $notes += "Suspicious execution patterns in 4688."
+      $evts += ($sus | ForEach-Object { EventToBrief $_ "Security" })
+    } else {
+      $notes += "4688 available; no suspicious execution patterns matched."
+    }
+  } else {
+    $notes += "No 4688 telemetry."
+  }
+
+  $psLog = "Microsoft-Windows-PowerShell/Operational"
+  if (Test-LogAvailable $psLog) {
+    $ps4104 = Get-EventsSafe -LogName $psLog -Ids @(4104) -StartTime $StartTime
+    $hit = $ps4104 | Where-Object { $_.Message -match '(EncodedCommand|FromBase64String|\biex\b|Invoke-Expression|DownloadString|Invoke-WebRequest)' }
+    if ($hit.Count -gt 0) {
+      $notes += "Suspicious PowerShell script blocks detected (4104)."
+      $evts += ($hit | Select-Object -First 30 | ForEach-Object { EventToBrief $_ $psLog })
+    }
+  } else {
+    $notes += "PowerShell Operational log not available."
+  }
+
+  $detected = ($evts.Count -gt 0) ? "Yes" : "No"
+  return New-ResultRow -Tactic "Execution (4688 + script logging)" -Detected $detected -LastSeen (Select-LastSeen $evts) -Notes ($notes -join " ") -Events $evts
+}
+
+function Detect-PrivilegeEscalation {
+  $notes = @()
+  $evts = @()
+
+  # Domain/priv group membership changes (on DC these are authoritative)
+  $grp = Get-EventsSafe -LogName "Security" -Ids @(4728,4729,4732,4733,4756,4757,4672) -StartTime $StartTime
+  if ($grp.Count -gt 0) {
+    $notes += "Group/privilege change events present (4728/4729/4732/4733/4756/4757/4672)."
+    $evts += ($grp | Select-Object -First 80 | ForEach-Object { EventToBrief $_ "Security" })
+  } else {
+    $notes += "No group/privilege change events found (or auditing not enabled)."
+  }
+
+  # LSASS access via Sysmon 10 if available (rare on DC but possible)
+  $sysmon = "Microsoft-Windows-Sysmon/Operational"
+  if (Test-LogAvailable $sysmon) {
+    $s10 = Get-EventsSafe -LogName $sysmon -Ids @(10) -StartTime $StartTime
+    $hit = $s10 | Where-Object { $_.Message -match '(?i)TargetImage.*\\lsass\.exe' -or $_.Message -match '(?i)lsass\.exe' }
+    if ($hit.Count -gt 0) {
+      $notes += "Possible LSASS access observed (Sysmon 10)."
+      $evts += ($hit | Select-Object -First 30 | ForEach-Object { EventToBrief $_ $sysmon })
+    }
+  } else {
+    $notes += "Sysmon not present; LSASS access detection limited."
+  }
+
+  $detected = ($evts.Count -gt 0) ? "Yes" : "No"
+  return New-ResultRow -Tactic "Privilege Escalation (domain group changes + LSASS access)" -Detected $detected -LastSeen (Select-LastSeen $evts) -Notes ($notes -join " ") -Events $evts
+}
+
+function Detect-DefenseEvasion {
+  $notes = @()
+  $evts = @()
+
+  $clrSec = Get-EventsSafe -LogName "Security" -Ids @(1102) -StartTime $StartTime
+  if ($clrSec.Count -gt 0) {
+    $notes += "Security log clear detected (1102)."
+    $evts += ($clrSec | ForEach-Object { EventToBrief $_ "Security" })
+  }
+
+  $clrSys = Get-EventsSafe -LogName "System" -Ids @(104) -StartTime $StartTime
+  if ($clrSys.Count -gt 0) {
+    $notes += "Event log cleared (System 104)."
+    $evts += ($clrSys | ForEach-Object { EventToBrief $_ "System" })
+  }
+
+  $psLog = "Microsoft-Windows-PowerShell/Operational"
+  if (Test-LogAvailable $psLog) {
+    $ps4104 = Get-EventsSafe -LogName $psLog -Ids @(4104) -StartTime $StartTime
+    $amsi = $ps4104 | Where-Object { $_.Message -match '(?i)AmsiUtils|amsiInitFailed|Set-MpPreference|Add-MpPreference|DisableRealtimeMonitoring' }
+    if ($amsi.Count -gt 0) {
+      $notes += "Possible AMSI/Defender evasion strings in 4104."
+      $evts += ($amsi | Select-Object -First 30 | ForEach-Object { EventToBrief $_ $psLog })
+    }
+  } else {
+    $notes += "PowerShell Operational log not available; AMSI bypass detection limited."
+  }
+
+  $detected = ($evts.Count -gt 0) ? "Yes" : "No"
+  return New-ResultRow -Tactic "Defense Evasion (log clearing + AMSI/Defender hints)" -Detected $detected -LastSeen (Select-LastSeen $evts) -Notes ($notes -join " ") -Events $evts
+}
+
+function Detect-CredentialAccess {
+  $notes = @()
+  $evts = @()
+
+  # Explicit credential use
+  $e4648 = Get-EventsSafe -LogName "Security" -Ids @(4648) -StartTime $StartTime
+  if ($e4648.Count -gt 0) {
+    $notes += "Explicit credential use detected (4648)."
+    $evts += ($e4648 | Select-Object -First 80 | ForEach-Object { EventToBrief $_ "Security" })
+  } else {
+    $notes += "No 4648 hits in window (or auditing not enabled)."
+  }
+
+  # DCSync-style indicator: 4662 with specific replication rights GUIDs
+  # GUIDs commonly referenced for:
+  #   DS-Replication-Get-Changes         1131f6aa-9c07-11d1-f79f-00c04fc2dcd2
+  #   DS-Replication-Get-Changes-All     1131f6ad-9c07-11d1-f79f-00c04fc2dcd2
+  #   DS-Replication-Get-Changes-In-Filtered-Set 89e95b76-444d-4c62-991a-0facbeda640c
+  $e4662 = Get-EventsSafe -LogName "Security" -Ids @(4662) -StartTime $StartTime
+  if ($e4662.Count -gt 0) {
+    $dcsyncHits = $e4662 | Where-Object {
+      $_.Message -match '(?i)1131f6aa-9c07-11d1-f79f-00c04fc2dcd2|1131f6ad-9c07-11d1-f79f-00c04fc2dcd2|89e95b76-444d-4c62-991a-0facbeda640c'
+    }
+    if ($dcsyncHits.Count -gt 0) {
+      $notes += "Potential DCSync-style directory replication access (4662 with replication rights GUIDs)."
+      $evts += ($dcsyncHits | Select-Object -First 50 | ForEach-Object { EventToBrief $_ "Security" })
+    } else {
+      $notes += "4662 present; no replication-right GUID hits matched."
+    }
+  } else {
+    $notes += "No 4662 hits (often depends on SACL/auditing)."
+  }
+
+  # Optional LSASS access via Sysmon 10
+  $sysmon = "Microsoft-Windows-Sysmon/Operational"
+  if (Test-LogAvailable $sysmon) {
+    $s10 = Get-EventsSafe -LogName $sysmon -Ids @(10) -StartTime $StartTime
+    $hit = $s10 | Where-Object { $_.Message -match '(?i)TargetImage.*\\lsass\.exe' -or $_.Message -match '(?i)lsass\.exe' }
+    if ($hit.Count -gt 0) {
+      $notes += "Possible LSASS access observed (Sysmon 10)."
+      $evts += ($hit | Select-Object -First 30 | ForEach-Object { EventToBrief $_ $sysmon })
+    }
+  } else {
+    $notes += "Sysmon not present; LSASS access detection limited."
+  }
+
+  $detected = ($evts.Count -gt 0) ? "Yes" : "No"
+  return New-ResultRow -Tactic "Credential Access (4648 + DCSync hints + LSASS access)" -Detected $detected -LastSeen (Select-LastSeen $evts) -Notes ($notes -join " ") -Events $evts
+}
+
+function Detect-LateralMovement {
+  $notes = @()
+  $evts = @()
+
+  # PsExec-like service install
+  $e7045 = Get-EventsSafe -LogName "System" -Ids @(7045) -StartTime $StartTime
+  $psex = $e7045 | Where-Object { $_.Message -match '(?i)PSEXESVC' -or $_.Message -match '(?i)psexec' }
+  if ($psex.Count -gt 0) {
+    $notes += "PsExec-like service install detected (System 7045)."
+    $evts += ($psex | ForEach-Object { EventToBrief $_ "System" })
+  }
+
+  # WMI activity
+  $wmiLog = "Microsoft-Windows-WMI-Activity/Operational"
+  if (Test-LogAvailable $wmiLog) {
+    $wmi = Get-EventsSafe -LogName $wmiLog -Ids @(5857,5858,5859,5860,5861) -StartTime $StartTime
+    if ($wmi.Count -gt 0) {
+      $notes += "WMI-Activity events present (possible WMI remote exec depending on content)."
+      $evts += ($wmi | Select-Object -First 30 | ForEach-Object { EventToBrief $_ $wmiLog })
+    }
+  } else {
+    $notes += "WMI-Activity Operational log not available."
+  }
+
+  # WinRM activity
+  $winrmLog = "Microsoft-Windows-WinRM/Operational"
+  if (Test-LogAvailable $winrmLog) {
+    $wrm = Get-EventsSafe -LogName $winrmLog -Ids @() -StartTime $StartTime
+    $wrmHit = $wrm | Where-Object { $_.Message -match '(?i)client|operation|listener|request' } | Select-Object -First 30
+    if ($wrmHit.Count -gt 0) {
+      $notes += "WinRM operational activity present (context needed)."
+      $evts += ($wrmHit | ForEach-Object { EventToBrief $_ $winrmLog })
+    }
+  } else {
+    $notes += "WinRM Operational log not available."
+  }
+
+  # Remote logons to DC (4624 type 3/10 with source IP)
+  $e4624 = Get-EventsSafe -LogName "Security" -Ids @(4624) -StartTime $StartTime
+  $remote = @()
+  foreach ($e in $e4624) {
+    $d = Get-EvtData $e
+    $lt = 0; [void][int]::TryParse($d["LogonType"], [ref]$lt)
+    $ip = $d["IpAddress"]
+    if (($lt -eq 3 -or $lt -eq 10) -and $ip -and $ip -ne "-" -and $ip -ne "127.0.0.1" -and $ip -ne "::1") {
+      $remote += $e
+    }
+  }
+  if ($remote.Count -gt 0) {
+    $notes += "Remote logons to DC detected (4624 type 3/10 with source IP)."
+    $evts += ($remote | Select-Object -First 40 | ForEach-Object { EventToBrief $_ "Security" })
+  } else {
+    $notes += "No remote logons detected (or insufficient auditing)."
+  }
+
+  $detected = ($evts.Count -gt 0) ? "Yes" : "No"
+  return New-ResultRow -Tactic "Lateral Movement (PsExec/WMI/WinRM + remote logons to DC)" -Detected $detected -LastSeen (Select-LastSeen $evts) -Notes ($notes -join " ") -Events $evts
+}
+
+function Detect-CommandAndControl {
+  $notes = @()
+  $evts = @()
+
+  $sysmon = "Microsoft-Windows-Sysmon/Operational"
+  if (Test-LogAvailable $sysmon) {
+    $s3 = Get-EventsSafe -LogName $sysmon -Ids @(3) -StartTime $StartTime
+    if ($s3.Count -gt 0) {
+      $groups = @{}
+      foreach ($e in $s3) {
+        $msg = $e.Message
+        $img = ""; $dip = ""; $dpt = ""
+        if ($msg -match '(?im)^Image:\s*(.+)$') { $img = $Matches[1].Trim() }
+        if ($msg -match '(?im)^DestinationIp:\s*(.+)$') { $dip = $Matches[1].Trim() }
+        if ($msg -match '(?im)^DestinationPort:\s*(.+)$') { $dpt = $Matches[1].Trim() }
+        if (-not $dip -or $dip -eq "-" -or $dip -eq "127.0.0.1" -or $dip -eq "::1") { continue }
+        $key = ($img + "|" + $dip + ":" + $dpt).ToLower()
+        if (-not $groups.ContainsKey($key)) { $groups[$key] = @() }
+        $groups[$key] += $e
+      }
+
+      $hits = @()
+      foreach ($k in $groups.Keys) {
+        if ($groups[$k].Count -ge 50) { $hits += $groups[$k] }
+      }
+
+      if ($hits.Count -gt 0) {
+        $notes += "Beacon-like pattern: high-volume repeated outbound connections (Sysmon 3)."
+        $evts += ($hits | Sort-Object TimeCreated -Descending | Select-Object -First 50 | ForEach-Object { EventToBrief $_ $sysmon })
+      } else {
+        $notes += "Sysmon 3 present; no high-volume beacon heuristic hits."
+      }
+    } else {
+      $notes += "Sysmon present; no Sysmon 3 network events found."
+    }
+  } else {
+    $notes += "Sysmon not present; network beaconing detection limited."
+  }
+
+  $e5156 = Get-EventsSafe -LogName "Security" -Ids @(5156) -StartTime $StartTime
+  if ($e5156.Count -gt 0) {
+    $notes += "Windows Filtering Platform connection audit events present (5156)."
+    if ($evts.Count -lt 1) {
+      $evts += ($e5156 | Select-Object -First 30 | ForEach-Object { EventToBrief $_ "Security" })
+    }
+  } else {
+    $notes += "No 5156 events (often disabled)."
+  }
+
+  $detected = ($evts.Count -gt 0) ? "Yes" : "No"
+  return New-ResultRow -Tactic "Command & Control (beacon heuristic: Sysmon 3 / 5156)" -Detected $detected -LastSeen (Select-LastSeen $evts) -Notes ($notes -join " ") -Events $evts
+}
+
+# -----------------------
+# Run
+# -----------------------
+$results = @()
+$results += Detect-InitialAccess
+$results += Detect-Execution
+$results += Detect-PrivilegeEscalation
+$results += Detect-DefenseEvasion
+$results += Detect-CredentialAccess
+$results += Detect-LateralMovement
+$results += Detect-CommandAndControl
+
+# -----------------------
+# Build HTML
+# -----------------------
+$css = @"
+<style>
+  body { font-family: Segoe UI, Arial, sans-serif; margin: 16px; }
+  h1 { margin-bottom: 6px; }
+  .meta { color: #444; margin-bottom: 14px; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 18px; }
+  th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
+  th { background: #f4f4f4; }
+  .yes { background: #ffe5e5; }   /* light red */
+  .no  { background: #e9ffe9; }   /* light green */
+  .note { color: #333; }
+  .small { font-size: 12px; color: #555; }
+  pre { white-space: pre-wrap; background: #fafafa; border: 1px solid #eee; padding: 10px; }
+</style>
+"@
+
+$meta = "Computer: $env:COMPUTERNAME (DC) | StartTime: $StartTime | HoursBack: $HoursBack | Generated: $(Get-Date)"
+
+$sb = New-Object System.Text.StringBuilder
+[void]$sb.AppendLine("<html><head><meta charset='utf-8' />$css</head><body>")
+[void]$sb.AppendLine("<h1>IR DC Triage Report</h1>")
+[void]$sb.AppendLine("<div class='meta'>$(HtmlEncode $meta)</div>")
+
+[void]$sb.AppendLine("<h2>Summary</h2>")
+[void]$sb.AppendLine("<table><tr><th>Tactic</th><th>Detected</th><th>Last Seen</th><th>Notes</th></tr>")
+foreach ($r in $results) {
+  $cls = if ($r.Detected -eq "Yes") { "yes" } else { "no" }
+  $ls  = $r.LastSeen
+  $lsText = $ls ? $ls.ToString("yyyy-MM-dd HH:mm:ss") : "-"
+  [void]$sb.AppendLine("<tr class='$cls'><td>$(HtmlEncode $r.Tactic)</td><td><b>$(HtmlEncode $r.Detected)</b></td><td>$(HtmlEncode $lsText)</td><td class='note'>$(HtmlEncode $r.Notes)</td></tr>")
+}
+[void]$sb.AppendLine("</table>")
+
+if ($IncludeVerbose) {
+  [void]$sb.AppendLine("<h2>Verbose Details (Detected Only)</h2>")
+  foreach ($r in $results | Where-Object { $_.Detected -eq "Yes" }) {
+    [void]$sb.AppendLine("<h3>$(HtmlEncode $r.Tactic)</h3>")
+    [void]$sb.AppendLine("<div class='small'>LastSeen: $(HtmlEncode (($r.LastSeen) ? $r.LastSeen.ToString("yyyy-MM-dd HH:mm:ss") : "-"))</div>")
+
+    if (-not $r.Events -or $r.Events.Count -lt 1) {
+      [void]$sb.AppendLine("<div class='small'>No event details captured (telemetry may be limited).</div>")
+      continue
+    }
+
+    [void]$sb.AppendLine("<table><tr><th>Time</th><th>Log</th><th>EventId</th><th>Provider</th><th>Message (truncated)</th></tr>")
+    foreach ($e in ($r.Events | Sort-Object TimeCreated -Descending | Select-Object -First 60)) {
+      $t = ($e.TimeCreated) ? $e.TimeCreated.ToString("yyyy-MM-dd HH:mm:ss") : "-"
+      [void]$sb.AppendLine("<tr><td>$(HtmlEncode $t)</td><td>$(HtmlEncode $e.Log)</td><td>$(HtmlEncode ($e.Id.ToString()))</td><td>$(HtmlEncode $e.Provider)</td><td>$(HtmlEncode $e.Message)</td></tr>")
+    }
+    [void]$sb.AppendLine("</table>")
+  }
+}
+
+[void]$sb.AppendLine("</body></html>")
+
+try {
+  $sb.ToString() | Out-File -FilePath $OutPath -Encoding UTF8 -Force
+  Write-Host "[+] Wrote report: $OutPath" -ForegroundColor Green
+} catch {
+  Write-Host "[!] Failed to write report: $($_.Exception.Message)" -ForegroundColor Red
+}

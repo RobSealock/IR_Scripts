@@ -1,0 +1,286 @@
+<#
+    Domain Logon Report Generator (PowerShell 5.1 Compatible)
+    - Interactive prompts
+    - High-risk account detection
+    - HTML + CSV + JSON output
+    - Top-N reporting
+#>
+
+# ============================
+# Interactive Prompts
+# ============================
+
+$HoursBack = Read-Host "How many hours back should we search? (default 24)"
+if (-not $HoursBack) { $HoursBack = 24 }
+
+$IncludeServices = (Read-Host "Include service & batch logons? (y/n)") -eq 'y'
+$IncludeNetwork  = (Read-Host "Include network logons (Type 3)? (y/n)") -eq 'y'
+
+$DoTopN = (Read-Host "Show Top-N accounts by number of logons? (y/n)") -eq 'y'
+if ($DoTopN) {
+    $TopN = Read-Host "How many accounts should be shown? (e.g., 10)"
+}
+
+$HtmlPath = Read-Host "HTML output path (default .\DomainLogons.html)"
+if (-not $HtmlPath) { $HtmlPath = ".\DomainLogons.html" }
+
+$DoCsv = (Read-Host "Export results to CSV? (y/n)") -eq 'y'
+if ($DoCsv) {
+    $CsvPath = Read-Host "CSV output path (default .\DomainLogons.csv)"
+    if (-not $CsvPath) { $CsvPath = ".\DomainLogons.csv" }
+}
+
+$DoJson = (Read-Host "Export results to JSON? (y/n)") -eq 'y'
+if ($DoJson) {
+    $JsonPath = Read-Host "JSON output path (default .\DomainLogons.json)"
+    if (-not $JsonPath) { $JsonPath = ".\DomainLogons.json" }
+}
+
+$start = (Get-Date).AddHours(-[int]$HoursBack)
+
+# ============================
+# Discover Domain Controllers
+# ============================
+
+$DCs = Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName
+
+# ============================
+# Logon Types
+# ============================
+
+$UserLogonTypes    = @(2,7,10,11)
+$ServiceLogonTypes = @(5,4)
+$NetworkLogonTypes = @(3)
+
+$allowedTypes = @()
+$allowedTypes += $UserLogonTypes
+if ($IncludeServices) { $allowedTypes += $ServiceLogonTypes }
+if ($IncludeNetwork)  { $allowedTypes += $NetworkLogonTypes }
+
+$LogonTypeMap = @{
+  2  = 'Interactive'
+  3  = 'Network'
+  4  = 'Batch'
+  5  = 'Service'
+  7  = 'Unlock'
+  8  = 'NetworkCleartext'
+  9  = 'NewCredentials'
+  10 = 'RemoteInteractive'
+  11 = 'CachedInteractive'
+}
+
+# ============================
+# Helper: Extract Event XML Data
+# ============================
+
+function Get-EvtDataValue {
+  param($Event, [string]$Name)
+  $xml = [xml]$Event.ToXml()
+  ($xml.Event.EventData.Data | Where-Object { $_.Name -eq $Name } | Select-Object -First 1).'#text'
+}
+
+# ============================
+# High-Risk Account Detection
+# ============================
+
+$StaticHighRisk = @('Administrator','ANONYMOUS LOGON','Guest','krbtgt')
+$HighPrivGroups = @('Domain Admins','Enterprise Admins','Administrators')
+
+$HighPrivMembers = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+foreach ($grpName in $HighPrivGroups) {
+    try {
+        $grp = Get-ADGroup -Filter "Name -eq '$grpName'"
+        if ($grp) {
+            Get-ADGroupMember $grp -Recursive |
+                Where-Object { $_.ObjectClass -eq 'user' } |
+                ForEach-Object { [void]$HighPrivMembers.Add($_.SamAccountName) }
+        }
+    } catch {
+        Write-Warning "Failed to resolve group $grpName : $($_.Exception.Message)"
+    }
+}
+
+function Get-RiskLevel {
+    param([string]$Account)
+    if ([string]::IsNullOrWhiteSpace($Account)) { return 'Low' }
+    $user = $Account.Split('\')[-1]
+    if ($StaticHighRisk -contains $user) { return 'High' }
+    if ($HighPrivMembers.Contains($user)) { return 'High' }
+    return 'Low'
+}
+
+# ============================
+# Collect Logons
+# ============================
+
+$logons = foreach ($dc in $DCs) {
+    try {
+        Get-WinEvent -ComputerName $dc -FilterHashtable @{
+            LogName='Security'; Id=4624; StartTime=$start
+        } | ForEach-Object {
+
+            $lt = [int](Get-EvtDataValue $_ 'LogonType')
+            if ($allowedTypes -notcontains $lt) { return }
+
+            $user = Get-EvtDataValue $_ 'TargetUserName'
+            if ($user -like '*$' -or [string]::IsNullOrWhiteSpace($user)) { return }
+
+            $dom  = Get-EvtDataValue $_ 'TargetDomainName'
+            $acct = if ($dom) { "$dom\$user" } else { $user }
+
+            [pscustomobject]@{
+                Account       = $acct
+                Time          = $_.TimeCreated
+                System        = $dc
+                LogonType     = $lt
+                LogonTypeName = $LogonTypeMap[$lt]
+                LogonId       = Get-EvtDataValue $_ 'TargetLogonId'
+                SourceIP      = Get-EvtDataValue $_ 'IpAddress'
+                Workstation   = Get-EvtDataValue $_ 'WorkstationName'
+                RiskLevel     = Get-RiskLevel $acct
+            }
+        }
+    } catch {
+        Write-Warning "Failed querying $dc : $($_.Exception.Message)"
+    }
+}
+
+# ============================
+# Collect Logoffs
+# ============================
+
+$logoffs = foreach ($dc in $DCs) {
+    try {
+        Get-WinEvent -ComputerName $dc -FilterHashtable @{
+            LogName='Security'; Id=4634,4647; StartTime=$start
+        } | ForEach-Object {
+            $user = Get-EvtDataValue $_ 'TargetUserName'
+            if ($user -like '*$') { return }
+
+            $dom = Get-EvtDataValue $_ 'TargetDomainName'
+            [pscustomobject]@{
+                Account = if ($dom) { "$dom\$user" } else { $user }
+                LogonId = Get-EvtDataValue $_ 'TargetLogonId'
+            }
+        }
+    } catch {
+        Write-Warning "Failed querying logoffs on $dc : $($_.Exception.Message)"
+    }
+}
+
+# ============================
+# Determine Current Logons
+# ============================
+
+$logoffSet = @{}
+foreach ($lo in $logoffs) {
+    $key = "$($lo.Account)|$($lo.LogonId)"
+    $logoffSet[$key] = $true
+}
+
+$current = $logons | Where-Object {
+    $key = "$($_.Account)|$($_.LogonId)"
+    -not $logoffSet.ContainsKey($key)
+} | Sort-Object Time -Descending
+
+# ============================
+# Optional Top-N Summary
+# ============================
+
+if ($DoTopN) {
+    Write-Host "`nTop $TopN Accounts by Logon Count:`n"
+    $current |
+        Group-Object Account |
+        Sort-Object Count -Descending |
+        Select-Object -First $TopN |
+        Format-Table Name,Count
+}
+
+# ============================
+# HTML Output (with Risk Coloring)
+# ============================
+
+$css = @"
+<style>
+  body { font-family: Segoe UI, Arial; font-size: 12px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #ccc; padding: 4px 6px; }
+  th { background-color: #f0f0f0; }
+  tr.high-risk { background-color: #ffe5e5; }
+  tr.low-risk  { background-color: #ffffff; }
+</style>
+"@
+
+# Build table fragment
+$rows = $current | Select-Object Account,Time,System,LogonTypeName,LogonType,Workstation,SourceIP,RiskLevel
+$tableFragment = $rows | ConvertTo-Html -Property Account,Time,System,LogonTypeName,LogonType,Workstation,SourceIP,RiskLevel -Fragment
+
+# Load fragment as XML and add row classes based on RiskLevel
+[xml]$doc = $tableFragment
+$trNodes = $doc.GetElementsByTagName("tr")
+
+for ($i = 1; $i -lt $trNodes.Count; $i++) {  # skip header row
+    $tr = $trNodes[$i]
+    $cells = $tr.GetElementsByTagName("td")
+    if ($cells.Count -gt 0) {
+        $riskCell = $cells.Item($cells.Count - 1)
+        $riskText = $riskCell.InnerText
+        $classAttr = $doc.CreateAttribute("class")
+        if ($riskText -eq 'High') {
+            $classAttr.Value = "high-risk"
+        } else {
+            $classAttr.Value = "low-risk"
+        }
+        [void]$tr.Attributes.Append($classAttr)
+    }
+}
+
+$tableHtml = $doc.OuterXml
+
+$header = "<h2>Current Domain Logons (Last $HoursBack Hours)</h2>"
+$legend = "<p><strong>Legend:</strong> <span style='background-color:#ffe5e5;padding:2px 4px;'>High Risk</span> = high-privileged or sensitive accounts.</p>"
+
+$fullHtml = @"
+<html>
+<head>
+<meta charset='utf-8' />
+<title>Domain Logons</title>
+$css
+</head>
+<body>
+$header
+$legend
+$tableHtml
+</body>
+</html>
+"@
+
+$fullHtml | Out-File $HtmlPath -Encoding UTF8
+Write-Host "`nHTML report written to $HtmlPath"
+
+# ============================
+# CSV Export
+# ============================
+
+if ($DoCsv) {
+    try {
+        $current | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
+        Write-Host "CSV exported to $CsvPath"
+    } catch {
+        Write-Warning "Failed to export CSV: $($_.Exception.Message)"
+    }
+}
+
+# ============================
+# JSON Export (Depth = 6)
+# ============================
+
+if ($DoJson) {
+    try {
+        $current | ConvertTo-Json -Depth 6 | Out-File -FilePath $JsonPath -Encoding UTF8
+        Write-Host "JSON exported to $JsonPath"
+    } catch {
+        Write-Warning "Failed to export JSON: $($_.Exception.Message)"
+    }
+}

@@ -1,0 +1,878 @@
+<#
+.SYNOPSIS
+  Review Windows logon/logoff activity (user + service accounts) with reboot annotations,
+  post-reboot summaries, session correlation, risk scoring, group membership, gap analysis,
+  and PS 5.1-safe HTML/CSV reporting.
+
+.DESCRIPTION
+  - Logons: 4624 (Security)
+  - Logoffs: 4634, 4647 (Security)
+  - Reboot/Shutdown markers: 6005, 6006, 6008, 41, 1074, 6009 (System)
+
+  Output:
+  - Max timeline discovery (oldest event available)
+  - Timeline objects combining logon/logoff + reboot notes
+  - Correlated sessions (logon → logoff, duration, risk, groups, off-hours, gaps)
+  - Post-reboot summaries
+  - Optional CSV/HTML exports (color-coded risk) without AD/ADSI dependencies
+
+.PARAMETER Window
+  One of: Max, 48h, 24h, 1h
+
+.PARAMETER Hours
+  Optional custom lookback in hours (overrides Window except Max)
+
+.PARAMETER IncludeComputerAccounts
+  Include accounts ending with '$' (machine accounts). Default: $false.
+
+.PARAMETER IncludeNoiseAccounts
+  Include built-in noise (e.g., LOCAL SERVICE, NETWORK SERVICE, SYSTEM, UMFD-*, DWM-*). Default: $true.
+
+.PARAMETER OutputCsv
+  Optional path to write CSV with correlated sessions.
+
+.PARAMETER OutputHtml
+  Optional path to write HTML report (timeline + sessions).
+
+#>
+
+#Requires -RunAsAdministrator
+
+[CmdletBinding()]
+param(
+  [ValidateSet("Max","48h","24h","1h")]
+  [string]$Window = "48h",
+
+  [int]$Hours,
+
+  [switch]$IncludeComputerAccounts,
+
+  [switch]$IncludeNoiseAccounts,
+
+  [string]$OutputCsv,
+
+  [string]$OutputHtml
+)
+
+Set-StrictMode -Version Latest
+
+# -----------------------------
+# Helpers
+# -----------------------------
+
+function Get-EventOldestTime {
+  param(
+    [Parameter(Mandatory)] [string]$LogName,
+    [Parameter(Mandatory)] [int[]]$Ids
+  )
+  try {
+    $ev = Get-WinEvent -FilterHashtable @{ LogName=$LogName; Id=$Ids } -MaxEvents 1 -ErrorAction Stop -Oldest
+    return $ev.TimeCreated
+  } catch {
+    return $null
+  }
+}
+
+function Get-EventNewestTime {
+  param(
+    [Parameter(Mandatory)] [string]$LogName,
+    [Parameter(Mandatory)] [int[]]$Ids
+  )
+  try {
+    $ev = Get-WinEvent -FilterHashtable @{ LogName=$LogName; Id=$Ids } -MaxEvents 1 -ErrorAction Stop
+    return $ev.TimeCreated
+  } catch {
+    return $null
+  }
+}
+
+function Get-StartTime {
+  param([string]$Window,[int]$Hours)
+
+  if ($Window -eq "Max") { return $null }
+  if ($PSBoundParameters.ContainsKey('Hours') -and $Hours -gt 0) {
+    return (Get-Date).AddHours(-1 * $Hours)
+  }
+
+  switch ($Window) {
+    "48h" { return (Get-Date).AddHours(-48) }
+    "24h" { return (Get-Date).AddHours(-24) }
+    "1h"  { return (Get-Date).AddHours(-1) }
+    default { return (Get-Date).AddHours(-48) }
+  }
+}
+
+function Parse-WinEventXmlData {
+  param([Parameter(Mandatory)] $Event)
+
+  $xml = [xml]$Event.ToXml()
+  $data = @{}
+  foreach ($d in $xml.Event.EventData.Data) {
+    if ($d.Name) { $data[$d.Name] = [string]$d.'#text' }
+  }
+  return $data
+}
+
+function Classify-LogonType {
+  param([Parameter(Mandatory)][int]$LogonType)
+
+  switch ($LogonType) {
+    2  { return "Interactive" }
+    3  { return "Network" }
+    4  { return "Batch" }
+    5  { return "Service" }
+    7  { return "Unlock" }
+    8  { return "NetworkCleartext" }
+    9  { return "NewCredentials" }
+    10 { return "RemoteInteractive" }
+    11 { return "CachedInteractive" }
+    default { return "Other" }
+  }
+}
+
+function Normalize-LogonId {
+  param([string]$LogonId)
+
+  if (-not $LogonId) { return $null }
+  $trim = $LogonId.Trim()
+
+  if ($trim -match '^0x[0-9A-Fa-f]+$') {
+    $val = [int64]::Parse($trim.Substring(2), [System.Globalization.NumberStyles]::HexNumber)
+    return ('{0:X}' -f $val)
+  }
+  elseif ($trim -match '^[0-9A-Fa-f]+$' -and $trim -match '[A-Fa-f]') {
+    $val = [int64]::Parse($trim, [System.Globalization.NumberStyles]::HexNumber)
+    return ('{0:X}' -f $val)
+  }
+  elseif ($trim -match '^\d+$') {
+    $val = [int64]::Parse($trim)
+    return ('{0:X}' -f $val)
+  }
+
+  return $trim.ToUpperInvariant()
+}
+
+function Should-IncludeAccount {
+  param(
+    [Parameter(Mandatory)][string]$User,
+    [Parameter(Mandatory)][string]$Domain,
+    [switch]$IncludeComputerAccounts,
+    [switch]$IncludeNoiseAccounts
+  )
+
+  if (-not $IncludeComputerAccounts -and $User.EndsWith('$')) { return $false }
+
+  if (-not $IncludeNoiseAccounts) {
+    $noiseUsers = @(
+      "SYSTEM","LOCAL SERVICE","NETWORK SERVICE","ANONYMOUS LOGON",
+      "UMFD-0","UMFD-1","DWM-1","DWM-2"
+    )
+    if ($noiseUsers -contains $User) { return $false }
+
+    if ($Domain -eq "NT AUTHORITY" -and $noiseUsers -contains $User) { return $false }
+    if ($Domain -eq "NT SERVICE") { return $false }
+    if ($Domain -eq "IIS APPPOOL") { return $false }
+  }
+
+  return $true
+}
+
+function Get-RebootMarkers {
+  param([datetime]$StartTime)
+
+  $ids = 6005,6006,6008,41,1074,6009
+  $filter = @{ LogName="System"; Id=$ids }
+  if ($StartTime) { $filter.StartTime = $StartTime }
+
+  Get-WinEvent -FilterHashtable $filter -ErrorAction SilentlyContinue |
+    Sort-Object TimeCreated |
+    ForEach-Object {
+      $note = switch ($_.Id) {
+        6005 { "EventLog service started (boot/reboot marker)" }
+        6006 { "EventLog service stopped (clean shutdown marker)" }
+        6008 { "Unexpected shutdown detected" }
+        41   { "Kernel-Power: unexpected reboot/power loss" }
+        1074 { "Planned shutdown/restart initiated" }
+        6009 { "OS version reported at boot" }
+        default { "Reboot/Shutdown marker" }
+      }
+
+      [pscustomobject]@{
+        Time      = $_.TimeCreated
+        Kind      = "RebootMarker"
+        EventId   = $_.Id
+        Account   = $null
+        LogonType = $null
+        LogonKind = $null
+        LogonId   = $null
+        IpAddress = $null
+        Process   = $null
+        Notes     = $note
+      }
+    }
+}
+
+function Get-LogonEvents {
+  param(
+    [datetime]$StartTime,
+    [switch]$IncludeComputerAccounts,
+    [switch]$IncludeNoiseAccounts
+  )
+
+  $filter = @{ LogName="Security"; Id=4624 }
+  if ($StartTime) { $filter.StartTime = $StartTime }
+
+  Get-WinEvent -FilterHashtable $filter -ErrorAction SilentlyContinue |
+    ForEach-Object {
+      $d = Parse-WinEventXmlData -Event $_
+
+      $user    = $d["TargetUserName"]
+      $domain  = $d["TargetDomainName"]
+      $ltRaw   = $d["LogonType"]
+      $logonId = Normalize-LogonId -LogonId $d["TargetLogonId"]
+      $ip      = $d["IpAddress"]
+      $proc    = $d["ProcessName"]
+
+      if (-not $user) { return }
+
+      if (-not (Should-IncludeAccount -User $user -Domain $domain -IncludeComputerAccounts:$IncludeComputerAccounts -IncludeNoiseAccounts:$IncludeNoiseAccounts)) {
+        return
+      }
+
+      $lt = 0
+      [void][int]::TryParse($ltRaw, [ref]$lt)
+      $kind = Classify-LogonType -LogonType $lt
+
+      [pscustomobject]@{
+        Time      = $_.TimeCreated
+        Kind      = "Logon"
+        EventId   = 4624
+        Account   = if ($domain) { "$domain\$user" } else { $user }
+        LogonType = $lt
+        LogonKind = $kind
+        LogonId   = $logonId
+        IpAddress = $ip
+        Process   = $proc
+        Notes     = $null
+      }
+    }
+}
+
+function Get-LogoffEvents {
+  param(
+    [datetime]$StartTime,
+    [switch]$IncludeComputerAccounts,
+    [switch]$IncludeNoiseAccounts
+  )
+
+  $filter = @{ LogName="Security"; Id=4634,4647 }
+  if ($StartTime) { $filter.StartTime = $StartTime }
+
+  Get-WinEvent -FilterHashtable $filter -ErrorAction SilentlyContinue |
+    ForEach-Object {
+      $d = Parse-WinEventXmlData -Event $_
+
+      $user    = $d["TargetUserName"]
+      $domain  = $d["TargetDomainName"]
+      $logonId = $d["LogonId"]
+      if (-not $logonId) { $logonId = $d["TargetLogonId"] }
+      $logonId = Normalize-LogonId -LogonId $logonId
+
+      if (-not $user -or $user -eq "-") {
+        $user = $null
+      }
+
+      if ($user) {
+        if (-not (Should-IncludeAccount -User $user -Domain $domain -IncludeComputerAccounts:$IncludeComputerAccounts -IncludeNoiseAccounts:$IncludeNoiseAccounts)) {
+          return
+        }
+      }
+
+      [pscustomobject]@{
+        Time      = $_.TimeCreated
+        Kind      = "Logoff"
+        EventId   = $_.Id
+        Account   = if ($user -and $domain) { "$domain\$user" } elseif ($user) { $user } else { $null }
+        LogonType = $null
+        LogonKind = $null
+        LogonId   = $logonId
+        IpAddress = $null
+        Process   = $null
+        Notes     = if ($_.Id -eq 4647) { "User initiated logoff" } else { $null }
+      }
+    }
+}
+
+function Get-LastBootMarkerTime {
+  try {
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+    if ($os.LastBootUpTime) { return [datetime]$os.LastBootUpTime }
+  } catch {}
+
+  try {
+    $ev = Get-WinEvent -FilterHashtable @{ LogName="System"; Id=6005 } -MaxEvents 1 -ErrorAction Stop
+    return $ev.TimeCreated
+  } catch {
+    return $null
+  }
+}
+
+function Get-UniqueByProperties {
+  param(
+    [Parameter(Mandatory)]$InputObjects,
+    [Parameter(Mandatory)][string[]]$Properties
+  )
+
+  $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+  $out  = New-Object 'System.Collections.Generic.List[object]'
+
+  foreach ($obj in $InputObjects) {
+    $parts = foreach ($p in $Properties) { [string]($obj.$p) }
+    $key   = ($parts -join '|')
+
+    if (-not $seen.Contains($key)) {
+      [void]$seen.Add($key)
+      $out.Add($obj)
+    }
+  }
+
+  $out
+}
+
+function Get-CurrentLoggedOnUsers {
+  $results = @()
+
+  try {
+    $sessions = Get-CimInstance Win32_LogonSession -ErrorAction Stop
+    foreach ($s in $sessions) {
+      $links = Get-CimAssociatedInstance -InputObject $s -Association Win32_LoggedOnUser -ErrorAction SilentlyContinue
+      foreach ($l in $links) {
+        $name = $l.Name
+        $dom  = $l.Domain
+        if ($name) {
+          $results += [pscustomobject]@{
+            Account   = if ($dom) { "$dom\$name" } else { $name }
+            LogonId   = Normalize-LogonId -LogonId ("{0}" -f $s.LogonId)
+            LogonType = $s.LogonType
+            StartTime = if ($s.StartTime) { [datetime]$s.StartTime } else { $null }
+          }
+        }
+      }
+    }
+  } catch {
+    try {
+      $raw = (quser 2>$null)
+      foreach ($line in $raw | Select-Object -Skip 1) {
+        $trim = ($line -replace '\s+', ' ').Trim()
+        if (-not $trim) { continue }
+        $user = ($trim.Split(' '))[0]
+        $results += [pscustomobject]@{
+          Account   = $user
+          LogonId   = $null
+          LogonType = $null
+          StartTime = $null
+        }
+      }
+    } catch {}
+  }
+
+  Get-UniqueByProperties -InputObjects $results -Properties @('Account','LogonId')
+}
+
+# -----------------------------
+# Group resolution via WMI/CIM only
+# -----------------------------
+
+function Get-AccountGroups {
+  param(
+    [Parameter(Mandatory)][string]$Account
+  )
+
+  # Account is DOMAIN\User or MACHINE\User
+  if ($Account -notmatch '^(?<dom>[^\\]+)\\(?<usr>.+)$') {
+    return @()
+  }
+
+  $dom = $Matches['dom']
+  $usr = $Matches['usr']
+
+  $groups = New-Object 'System.Collections.Generic.List[string]'
+
+  try {
+    # Win32_GroupUser links Win32_Group and Win32_Account
+    $rels = Get-CimInstance Win32_GroupUser -ErrorAction SilentlyContinue
+    if ($rels) {
+      foreach ($rel in $rels) {
+        $groupPath = $rel.GroupComponent
+        $userPath  = $rel.PartComponent
+
+        # Example: Win32_Group.Domain="MACHINE",Name="Administrators"
+        #          Win32_Account.Domain="DOMAIN",Name="User"
+        if ($groupPath -match 'Win32_Group\.Domain="([^"]+)",Name="([^"]+)"') {
+          $gDom = $Matches[1]
+          $gName = $Matches[2]
+        } else { continue }
+
+        if ($userPath -match 'Win32_Account\.Domain="([^"]+)",Name="([^"]+)"') {
+          $uDom = $Matches[1]
+          $uName = $Matches[2]
+        } else { continue }
+
+        if ($uDom -eq $dom -and $uName -eq $usr) {
+          $groups.Add($gName) | Out-Null
+        }
+      }
+    }
+  } catch {
+    # ignore
+  }
+
+  $groups | Sort-Object -Unique
+}
+
+function Is-OffHours {
+  param([datetime]$Time)
+
+  if (-not $Time) { return $false }
+  $hour = $Time.Hour
+  return ($hour -lt 6 -or $hour -gt 18)
+}
+
+function Get-RiskScore {
+  param(
+    [string]$LogonKind,
+    [string]$IpAddress,
+    [string[]]$Groups,
+    [datetime]$LogonTime
+  )
+
+  $score = 0
+  $tags  = New-Object 'System.Collections.Generic.List[string]'
+
+  switch ($LogonKind) {
+    "RemoteInteractive" { $score += 50; $tags.Add("RDP") | Out-Null }
+    "NetworkCleartext"  { $score += 40; $tags.Add("Cleartext") | Out-Null }
+    "NewCredentials"    { $score += 40; $tags.Add("RunAs/PassTheHash") | Out-Null }
+    "Network"           { $score += 20; $tags.Add("Network") | Out-Null }
+  }
+
+  if ($IpAddress -and $IpAddress -notin @("127.0.0.1","::1")) {
+    $score += 10
+    $tags.Add("RemoteIP") | Out-Null
+  }
+
+  $privGroups = @(
+    "Administrators",
+    "Domain Admins",
+    "Enterprise Admins",
+    "Remote Desktop Users",
+    "Backup Operators",
+    "Power Users"
+  )
+
+  $matched = $Groups | Where-Object { $privGroups -contains $_ }
+  if ($matched) {
+    $score += 50
+    $tags.Add("PrivilegedGroup: " + ($matched -join ",")) | Out-Null
+  }
+
+  if (Is-OffHours -Time $LogonTime) {
+    $score += 15
+    $tags.Add("OffHours") | Out-Null
+  }
+
+  $isHighRisk = $score -ge 60
+
+  [pscustomobject]@{
+    RiskScore  = $score
+    RiskTags   = ($tags -join ", ")
+    IsHighRisk = $isHighRisk
+  }
+}
+
+function Correlate-Sessions {
+  param(
+    [Parameter(Mandatory)]$Logons,
+    [Parameter(Mandatory)]$Logoffs,
+    [datetime]$StartTime
+  )
+
+  $logonById = @{}
+  foreach ($l in $Logons) {
+    if (-not $l.LogonId) { continue }
+    if (-not $logonById.ContainsKey($l.LogonId)) {
+      $logonById[$l.LogonId] = New-Object 'System.Collections.Generic.List[object]'
+    }
+    $logonById[$l.LogonId].Add($l)
+  }
+
+  $sessions = New-Object 'System.Collections.Generic.List[object]'
+
+  foreach ($lo in $Logoffs) {
+    if (-not $lo.LogonId) { continue }
+    if (-not $logonById.ContainsKey($lo.LogonId)) { continue }
+
+    $candidates = $logonById[$lo.LogonId] | Where-Object { $_.Time -le $lo.Time }
+    if (-not $candidates) { continue }
+
+    $logon = $candidates | Sort-Object Time -Descending | Select-Object -First 1
+
+    $duration = $null
+    if ($logon.Time -and $lo.Time) {
+      $duration = $lo.Time - $logon.Time
+    }
+
+    $groups = Get-AccountGroups -Account $logon.Account
+    $risk   = Get-RiskScore -LogonKind $logon.LogonKind -IpAddress $logon.IpAddress -Groups $groups -LogonTime $logon.Time
+
+    $sessions.Add([pscustomobject]@{
+      Account      = $logon.Account
+      Groups       = $groups -join ", "
+      LogonId      = $logon.LogonId
+      LogonTime    = $logon.Time
+      LogoffTime   = $lo.Time
+      Duration     = $duration
+      LogonKind    = $logon.LogonKind
+      LogonType    = $logon.LogonType
+      IpAddress    = $logon.IpAddress
+      Process      = $logon.Process
+      LogoffEvent  = $lo.EventId
+      LogoffNotes  = $lo.Notes
+      RiskScore    = $risk.RiskScore
+      RiskTags     = $risk.RiskTags
+      IsHighRisk   = $risk.IsHighRisk
+      WindowStart  = $StartTime
+      IsComplete   = $true
+      GapSinceLastLogoff = $null
+      IsGapSuspicious    = $false
+    })
+  }
+
+  foreach ($l in $Logons) {
+    if (-not $l.LogonId) { continue }
+    $hasSession = $sessions | Where-Object { $_.LogonId -eq $l.LogonId -and $_.LogonTime -eq $l.Time }
+    if ($hasSession) { continue }
+
+    $groups = Get-AccountGroups -Account $l.Account
+    $risk   = Get-RiskScore -LogonKind $l.LogonKind -IpAddress $l.IpAddress -Groups $groups -LogonTime $l.Time
+
+    $sessions.Add([pscustomobject]@{
+      Account      = $l.Account
+      Groups       = $groups -join ", "
+      LogonId      = $l.LogonId
+      LogonTime    = $l.Time
+      LogoffTime   = $null
+      Duration     = $null
+      LogonKind    = $l.LogonKind
+      LogonType    = $l.LogonType
+      IpAddress    = $l.IpAddress
+      Process      = $l.Process
+      LogoffEvent  = $null
+      LogoffNotes  = $null
+      RiskScore    = $risk.RiskScore
+      RiskTags     = $risk.RiskTags
+      IsHighRisk   = $risk.IsHighRisk
+      WindowStart  = $StartTime
+      IsComplete   = $false
+      GapSinceLastLogoff = $null
+      IsGapSuspicious    = $false
+    })
+  }
+
+  $sessions | Sort-Object Account, LogonTime
+}
+
+function Analyze-SessionGaps {
+  param(
+    [Parameter(Mandatory)]$Sessions
+  )
+
+  $byAccount = $Sessions | Group-Object Account
+  $updated = New-Object 'System.Collections.Generic.List[object]'
+
+  foreach ($grp in $byAccount) {
+    $prevLogoff = $null
+    foreach ($s in ($grp.Group | Sort-Object LogonTime)) {
+      $gap = $null
+      $suspicious = $false
+
+      if ($prevLogoff) {
+        $gap = $s.LogonTime - $prevLogoff
+        if ($gap.TotalMinutes -lt 1) {
+          $suspicious = $true
+        }
+      }
+
+      if ($s.LogoffTime) {
+        $prevLogoff = $s.LogoffTime
+      }
+
+      $updated.Add([pscustomobject]@{
+        Account      = $s.Account
+        Groups       = $s.Groups
+        LogonId      = $s.LogonId
+        LogonTime    = $s.LogonTime
+        LogoffTime   = $s.LogoffTime
+        Duration     = $s.Duration
+        LogonKind    = $s.LogonKind
+        LogonType    = $s.LogonType
+        IpAddress    = $s.IpAddress
+        Process      = $s.Process
+        LogoffEvent  = $s.LogoffEvent
+        LogoffNotes  = $s.LogoffNotes
+        RiskScore    = $s.RiskScore
+        RiskTags     = $s.RiskTags
+        IsHighRisk   = $s.IsHighRisk
+        WindowStart  = $s.WindowStart
+        IsComplete   = $s.IsComplete
+        GapSinceLastLogoff = $gap
+        IsGapSuspicious    = $suspicious
+      })
+    }
+  }
+
+  $updated | Sort-Object LogonTime
+}
+
+function Build-SessionTimeline {
+  param(
+    [Parameter(Mandatory)]$TimelineEvents,
+    [Parameter(Mandatory)]$Sessions
+  )
+
+  $sessionMarkers = foreach ($s in $Sessions) {
+    [pscustomobject]@{
+      Time      = $s.LogonTime
+      Kind      = "SessionStart"
+      EventId   = 0
+      Account   = $s.Account
+      LogonKind = $s.LogonKind
+      LogonType = $s.LogonType
+      LogonId   = $s.LogonId
+      IpAddress = $s.IpAddress
+      Process   = $s.Process
+      Notes     = "Session start (Risk=$($s.RiskScore); $($s.RiskTags))"
+    }
+
+    if ($s.LogoffTime) {
+      [pscustomobject]@{
+        Time      = $s.LogoffTime
+        Kind      = "SessionEnd"
+        EventId   = $s.LogoffEvent
+        Account   = $s.Account
+        LogonKind = $s.LogonKind
+        LogonType = $s.LogonType
+        LogonId   = $s.LogonId
+        IpAddress = $s.IpAddress
+        Process   = $s.Process
+        Notes     = "Session end"
+      }
+    }
+  }
+
+  @($TimelineEvents + $sessionMarkers) | Sort-Object Time
+}
+
+# -----------------------------
+# 1) Max timeline
+# -----------------------------
+$secOldest = Get-EventOldestTime -LogName "Security" -Ids @(4624,4634,4647)
+$sysOldest = Get-EventOldestTime -LogName "System"   -Ids @(6005,6006,6008,41,1074,6009)
+
+$secNewest = Get-EventNewestTime -LogName "Security" -Ids @(4624,4634,4647)
+$sysNewest = Get-EventNewestTime -LogName "System"   -Ids @(6005,6006,6008,41,1074,6009)
+
+$maxOldest = @($secOldest,$sysOldest) | Where-Object { $_ } | Sort-Object | Select-Object -First 1
+$maxNewest = @($secNewest,$sysNewest) | Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1
+
+Write-Host ""
+Write-Host "=== Maximum Available Timeline (Security+System) ===" -ForegroundColor Cyan
+Write-Host ("Oldest relevant event: {0}" -f ($maxOldest  ? $maxOldest.ToString("yyyy-MM-dd HH:mm:ss") : "N/A"))
+Write-Host ("Newest relevant event: {0}" -f ($maxNewest  ? $maxNewest.ToString("yyyy-MM-dd HH:mm:ss") : "N/A"))
+Write-Host ""
+
+# -----------------------------
+# 2) Window
+# -----------------------------
+$startTime = Get-StartTime -Window $Window -Hours $Hours
+if ($Window -eq "Max") { $startTime = $null }
+
+Write-Host "=== Evaluation Window ===" -ForegroundColor Cyan
+if ($startTime) {
+  Write-Host ("StartTime: {0}  (Now: {1})" -f $startTime.ToString("yyyy-MM-dd HH:mm:ss"), (Get-Date).ToString("yyyy-MM-dd HH:mm:ss"))
+} else {
+  Write-Host "StartTime: (Max)  => querying as far back as event logs allow (may take longer)"
+}
+Write-Host ""
+
+# -----------------------------
+# 3) Collect events
+# -----------------------------
+$reboots = Get-RebootMarkers -StartTime $startTime
+$logons  = Get-LogonEvents  -StartTime $startTime -IncludeComputerAccounts:$IncludeComputerAccounts -IncludeNoiseAccounts:$IncludeNoiseAccounts
+$logoffs = Get-LogoffEvents -StartTime $startTime -IncludeComputerAccounts:$IncludeComputerAccounts -IncludeNoiseAccounts:$IncludeNoiseAccounts
+
+$timeline = @($reboots + $logons + $logoffs) | Sort-Object Time
+
+# -----------------------------
+# 4) Reboot context
+# -----------------------------
+$lastBoot = Get-LastBootMarkerTime
+Write-Host "=== Reboot Context ===" -ForegroundColor Cyan
+Write-Host ("Last boot time (CIM/Event best-effort): {0}" -f ($lastBoot ? $lastBoot.ToString("yyyy-MM-dd HH:mm:ss") : "Unknown"))
+Write-Host ""
+
+$currentSessions = Get-CurrentLoggedOnUsers
+$currentAfterBoot = if ($lastBoot) {
+  $currentSessions | Where-Object { $_.StartTime -and $_.StartTime -ge $lastBoot }
+} else {
+  $currentSessions
+}
+
+$logonsAfterBoot = if ($lastBoot) {
+  $logons | Where-Object { $_.Time -ge $lastBoot }
+} else {
+  $logons
+}
+
+$allUsersAfterBoot = $logonsAfterBoot |
+  Group-Object Account |
+  ForEach-Object {
+    $first = ($_.Group | Sort-Object Time | Select-Object -First 1).Time
+    $last  = ($_.Group | Sort-Object Time -Descending | Select-Object -First 1).Time
+    $kinds = ($_.Group.LogonKind | Sort-Object -Unique) -join ", "
+    [pscustomobject]@{
+      Account     = $_.Name
+      FirstLogon  = $first
+      LastLogon   = $last
+      LogonKinds  = $kinds
+      LogonCount  = $_.Count
+    }
+  } | Sort-Object LastLogon -Descending
+
+# -----------------------------
+# 5) Sessions + gaps + timeline
+# -----------------------------
+$sessionsRaw      = Correlate-Sessions -Logons $logons -Logoffs $logoffs -StartTime $startTime
+$sessions         = Analyze-SessionGaps -Sessions $sessionsRaw
+$sessionTimeline  = Build-SessionTimeline -TimelineEvents $timeline -Sessions $sessions
+
+# -----------------------------
+# 6) Console output
+# -----------------------------
+Write-Host "=== Timeline (Events + Session Markers) ===" -ForegroundColor Cyan
+$sessionTimeline |
+  Select-Object Time, Kind, EventId, Account, LogonKind, LogonType, LogonId, IpAddress, Process, Notes |
+  Format-Table -AutoSize
+
+Write-Host ""
+Write-Host "=== Correlated Sessions (with Risk, Groups, Gaps) ===" -ForegroundColor Cyan
+$sessions |
+  Select-Object Account, Groups, LogonTime, LogoffTime, Duration, LogonKind, IpAddress, RiskScore, RiskTags, IsHighRisk, IsComplete, GapSinceLastLogoff, IsGapSuspicious |
+  Sort-Object LogonTime |
+  Format-Table -AutoSize
+
+Write-Host ""
+Write-Host "=== Summary: Currently Logged On Users (Live) ===" -ForegroundColor Cyan
+$currentSessions |
+  Select-Object Account, LogonType, StartTime, LogonId |
+  Sort-Object Account |
+  Format-Table -AutoSize
+
+Write-Host ""
+Write-Host "=== Summary: Currently Logged On Users After Reboot ===" -ForegroundColor Cyan
+$currentAfterBoot |
+  Select-Object Account, LogonType, StartTime, LogonId |
+  Sort-Object Account |
+  Format-Table -AutoSize
+
+Write-Host ""
+Write-Host "=== Summary: All Users Logged On After Reboot (from 4624 events) ===" -ForegroundColor Cyan
+$allUsersAfterBoot |
+  Select-Object Account, FirstLogon, LastLogon, LogonKinds, LogonCount |
+  Format-Table -AutoSize
+
+# -----------------------------
+# 7) CSV / HTML (PS 5.1-safe)
+# -----------------------------
+if ($OutputCsv) {
+  try {
+    $sessions | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+    Write-Host ("[+] Sessions CSV written to {0}" -f $OutputCsv) -ForegroundColor Green
+  } catch {
+    Write-Host ("[!] Failed to write CSV: {0}" -f $_.Exception.Message) -ForegroundColor Red
+  }
+}
+
+if ($OutputHtml) {
+  try {
+    $style = @"
+<style>
+body { font-family: Segoe UI, Arial, sans-serif; font-size: 12px; }
+table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+th, td { border: 1px solid #ccc; padding: 4px 6px; text-align: left; }
+th { background-color: #f0f0f0; }
+tr.highrisk { background-color: #ffcccc; }
+tr.mediumrisk { background-color: #fff2cc; }
+tr.lowrisk { background-color: #e6ffea; }
+tr.suspiciousgap { border: 2px solid #ff9900; }
+h1, h2 { font-family: Segoe UI, Arial, sans-serif; }
+</style>
+"@
+
+    # Timeline table (simple ConvertTo-Html, no -Fragment)
+    $timelineTable = ($sessionTimeline |
+      Select-Object Time, Kind, EventId, Account, LogonKind, LogonType, LogonId, IpAddress, Process, Notes |
+      ConvertTo-Html -Property Time,Kind,EventId,Account,LogonKind,LogonType,LogonId,IpAddress,Process,Notes -PreContent "<h2>Timeline (Events + Sessions)</h2>") -join "`n"
+
+    # Sessions table (manual rows for risk coloring)
+    $sessionRows = foreach ($s in $sessions | Sort-Object LogonTime) {
+      $class = "lowrisk"
+      if ($s.RiskScore -ge 60) { $class = "highrisk" }
+      elseif ($s.RiskScore -ge 30) { $class = "mediumrisk" }
+
+      if ($s.IsGapSuspicious) {
+        $class += " suspiciousgap"
+      }
+
+      "<tr class='$class'><td>$($s.Account)</td><td>$($s.Groups)</td><td>$($s.LogonTime)</td><td>$($s.LogoffTime)</td><td>$($s.Duration)</td><td>$($s.LogonKind)</td><td>$($s.IpAddress)</td><td>$($s.RiskScore)</td><td>$($s.RiskTags)</td><td>$($s.IsHighRisk)</td><td>$($s.IsComplete)</td><td>$($s.GapSinceLastLogoff)</td><td>$($s.IsGapSuspicious)</td></tr>"
+    }
+
+    $sessionsTable = @"
+<h2>Correlated Sessions</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Account</th><th>Groups</th><th>LogonTime</th><th>LogoffTime</th><th>Duration</th>
+      <th>LogonKind</th><th>IpAddress</th><th>RiskScore</th><th>RiskTags</th>
+      <th>IsHighRisk</th><th>IsComplete</th><th>GapSinceLastLogoff</th><th>IsGapSuspicious</th>
+    </tr>
+  </thead>
+  <tbody>
+    $($sessionRows -join "`n")
+  </tbody>
+</table>
+"@
+
+    $summaryTable = ($allUsersAfterBoot |
+      Select-Object Account, FirstLogon, LastLogon, LogonKinds, LogonCount |
+      ConvertTo-Html -Property Account,FirstLogon,LastLogon,LogonKinds,LogonCount -PreContent "<h2>Users Logged On After Reboot</h2>") -join "`n"
+
+    $body = @"
+<h1>Local Logon Review</h1>
+<p>Generated: $(Get-Date)</p>
+$timelineTable
+$sessionsTable
+$summaryTable
+"@
+
+    $fullHtml = ConvertTo-Html -Body $body -Title "Local Logon Review" -Head $style
+    $fullHtml | Out-File -FilePath $OutputHtml -Encoding UTF8
+
+    Write-Host ("[+] HTML report written to {0}" -f $OutputHtml) -ForegroundColor Green
+  } catch {
+    Write-Host ("[!] Failed to write HTML: {0}" -f $_.Exception.Message) -ForegroundColor Red
+  }
+}
+
+$sessionTimeline
