@@ -1,5 +1,11 @@
 <#
-    Domain Logon Report Generator (PowerShell 5.1 Compatible)
+Get-DomainLogons.ps1 (PowerShell 5.1 compat)
+
+.QUICK NOTES
+RobSealock @ 2026-02-14
+version 0.1
+
+Domain Logon Report Generator
     - Interactive prompts
     - High-risk account detection
     - HTML + CSV + JSON output
