@@ -1,0 +1,293 @@
+<#
+.SYNOPSIS
+    Two-stage Browser Extension Review:
+    1. Offline Mode: Scans local system for extensions (Chrome & Edge) and saves raw data to JSON.
+    2. Online Mode: Reads the JSON file, queries Web Stores for metadata, and generates an HTML report.
+
+.EXAMPLE
+    .\OffLineBrowserReview.ps1
+#>
+
+[CmdletBinding()]
+param()
+
+# --- Utility Functions ---
+
+function Get-ScriptDirectory {
+    if ($PSScriptRoot) { return $PSScriptRoot }
+    return Get-Location
+}
+
+function Get-ExtensionNameLocal {
+    param([string]$manifestPath)
+
+    if (-not (Test-Path -LiteralPath $manifestPath)) { return $null }
+
+    try {
+        $content = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop
+        $json = $content | ConvertFrom-Json
+
+        $name = $null
+        if ($json.name) {
+            if ($json.name -is [string]) { $name = $json.name }
+        }
+
+        # Resolve __MSG_appName__ using local _locales folders
+        if ($name -and $name.StartsWith("__MSG_")) {
+            $msgKey = $name -replace "__MSG_(.+?)__", '$1'
+            $baseDir = Split-Path -Parent $manifestPath
+            
+            $checkLocales = @()
+            if ($json.default_locale) { $checkLocales += $json.default_locale }
+            $checkLocales += @("en_US", "en", "en_GB")
+
+            foreach ($loc in $checkLocales) {
+                $msgPath = Join-Path $baseDir "_locales\$loc\messages.json"
+                if (Test-Path -LiteralPath $msgPath) {
+                    try {
+                        $msgJson = Get-Content -LiteralPath $msgPath -Raw | ConvertFrom-Json
+                        if ($msgJson.$msgKey.message) {
+                            return $msgJson.$msgKey.message
+                        }
+                    } catch {}
+                }
+            }
+        }
+        return $name
+    }
+    catch { return $null }
+}
+
+function Scan-ChromiumUserData {
+    param($BrowserName, $UserDataRoot, $UserLabel, $Collection)
+
+    if (-not (Test-Path -LiteralPath $UserDataRoot)) { return }
+
+    $profiles = Get-ChildItem -LiteralPath $UserDataRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -eq 'Default' -or $_.Name -like 'Profile *' }
+
+    foreach ($prof in $profiles) {
+        $extRoot = Join-Path $prof.FullName "Extensions"
+        if (-not (Test-Path -LiteralPath $extRoot)) { continue }
+
+        $dirs = Get-ChildItem -LiteralPath $extRoot -Directory -ErrorAction SilentlyContinue
+
+        foreach ($d in $dirs) {
+            $extId = $d.Name
+
+            # Get latest version folder
+            $verDirs = Get-ChildItem -LiteralPath $d.FullName -Directory -ErrorAction SilentlyContinue
+            if (-not $verDirs) { continue }
+            
+            $latestDir = $verDirs | Sort-Object { [version]($_.Name -replace '[^0-9.]','') } -Descending | Select-Object -First 1
+            $latestVer = $latestDir.Name
+            $manifestPath = Join-Path $latestDir.FullName "manifest.json"
+
+            # Resolve Local Name immediately
+            $localName = Get-ExtensionNameLocal $manifestPath
+
+            $obj = [pscustomobject]@{
+                User      = $UserLabel
+                Browser   = $BrowserName
+                Profile   = $prof.Name
+                ExtId     = $extId
+                Version   = $latestVer
+                LocalName = if ($localName) { $localName } else { $extId } # Fallback to ID if name is totally missing
+                Path      = $manifestPath
+            }
+            [void]$Collection.Add($obj)
+        }
+    }
+}
+
+function Get-ExtensionStoreMetadata {
+    param([string]$ExtId)
+
+    $result = [pscustomobject]@{
+        Name = $null; Description = $null; StoreUrl = $null; Source = "Unknown"
+    }
+
+    $Headers = @{ "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36" }
+    $resolved = $false
+
+    # 1. Chrome Web Store
+    try {
+        $url = "https://chrome.google.com/webstore/ajax/detail?hl=en&gl=US&pv=202402&id=$ExtId"
+        $resp = Invoke-WebRequest -Uri $url -Headers $Headers -ErrorAction Stop
+        $json = $resp.Content | ConvertFrom-Json
+        if ($json -and $json.Count -ge 2 -and $json[1][1][0]) {
+            $root = $json[1][1][0]
+            $result.Name = $root[23]; $result.Description = $root[6]; 
+            $result.StoreUrl = "https://chrome.google.com/webstore/detail/$ExtId"
+            $result.Source = "Chrome Web Store"
+            if ($result.Name) { $resolved = $true }
+        }
+    } catch {}
+
+    # 2. Edge Add-ons
+    if (-not $resolved) {
+        try {
+            $urlEdge = "https://microsoftedge.microsoft.com/addons/detail/$ExtId"
+            $respEdge = Invoke-WebRequest -Uri $urlEdge -Headers $Headers -ErrorAction SilentlyContinue
+            if ($respEdge.StatusCode -eq 200) {
+                $html = $respEdge.Content
+                if ($html -match '<meta property="og:title" content="([^"]+)"') { $result.Name = $matches[1] -replace ' - Microsoft Edge Addons','' }
+                if ($html -match '<meta property="og:description" content="([^"]+)"') { $result.Description = $matches[1] }
+                $result.StoreUrl = $urlEdge
+                $result.Source = "Edge Add-ons"
+            }
+        } catch {}
+    }
+    return $result
+}
+
+# --- Main Logic ---
+
+Clear-Host
+Write-Host "==========================================" -ForegroundColor Cyan
+Write-Host "    OFFLINE BROWSER EXTENSION REVIEW      " -ForegroundColor Cyan
+Write-Host "==========================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "1. OFFLINE CAPTURE (Run on target machine)" -ForegroundColor Yellow
+Write-Host "   Scans this computer and saves extension data to a JSON file."
+Write-Host ""
+Write-Host "2. ONLINE ANALYSIS (Run on internet machine)" -ForegroundColor Green
+Write-Host "   Reads a JSON file, fetches store details, and builds the HTML report."
+Write-Host ""
+
+$choice = Read-Host "Select an option (1 or 2)"
+
+if ($choice -eq '1') {
+    # --- OFFLINE MODE ---
+    Write-Host "`n[Offline Mode] Scanning local system..." -ForegroundColor Yellow
+    
+    $collectedData = [System.Collections.ArrayList]@()
+    $currentUser = $env:USERNAME
+
+    # Scan Current User
+    Scan-ChromiumUserData -BrowserName 'Chrome' -UserDataRoot "$env:LOCALAPPDATA\Google\Chrome\User Data" -UserLabel $currentUser -Collection $collectedData
+    Scan-ChromiumUserData -BrowserName 'Edge'   -UserDataRoot "$env:LOCALAPPDATA\Microsoft\Edge\User Data" -UserLabel $currentUser -Collection $collectedData
+
+    # Scan Other Users (if Admin)
+    $usersDir = Join-Path $env:SystemDrive "\Users"
+    if (Test-Path -LiteralPath $usersDir) {
+        Get-ChildItem -LiteralPath $usersDir -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $un = $_.Name
+            if ($un -in @('Public','Default','Default User','All Users',$currentUser)) { return }
+            Scan-ChromiumUserData -BrowserName 'Chrome' -UserDataRoot "$($_.FullName)\AppData\Local\Google\Chrome\User Data" -UserLabel $un -Collection $collectedData
+            Scan-ChromiumUserData -BrowserName 'Edge'   -UserDataRoot "$($_.FullName)\AppData\Local\Microsoft\Edge\User Data" -UserLabel $un -Collection $collectedData
+        }
+    }
+
+    $outFile = Join-Path (Get-ScriptDirectory) "BrowserExtensions_Offline.json"
+    $collectedData | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $outFile -Encoding UTF8
+    
+    Write-Host "`nSuccess! Found $($collectedData.Count) extensions." -ForegroundColor Green
+    Write-Host "Data saved to: $outFile" -ForegroundColor Cyan
+    Write-Host "Transfer this file to an online machine and run Option 2." -ForegroundColor Gray
+}
+elseif ($choice -eq '2') {
+    # --- ONLINE MODE ---
+    $scriptDir = Get-ScriptDirectory
+    $defaultFile = Join-Path $scriptDir "BrowserExtensions_Offline.json"
+
+    Write-Host "`n[Online Mode] Looking for offline data file..." -ForegroundColor Green
+    
+    $targetFile = $null
+    if (Test-Path -LiteralPath $defaultFile) {
+        Write-Host "Found file at: $defaultFile" -ForegroundColor Cyan
+        $confirm = Read-Host "Use this file? (Y/N)"
+        if ($confirm -eq 'Y' -or $confirm -eq '') { $targetFile = $defaultFile }
+    }
+
+    if (-not $targetFile) {
+        $targetFile = Read-Host "Enter full path to the .json file"
+        if (-not (Test-Path -LiteralPath $targetFile)) {
+            Write-Error "File not found!"
+            exit
+        }
+    }
+
+    $rawData = Get-Content -LiteralPath $targetFile -Raw | ConvertFrom-Json
+    Write-Host "Loaded $($rawData.Count) items. Querying web stores..." -ForegroundColor Yellow
+
+    $finalReport = [System.Collections.ArrayList]@()
+
+    foreach ($item in $rawData) {
+        Write-Host "Processing: $($item.ExtId) ($($item.LocalName))" -NoNewline
+
+        # Perform Online Lookup
+        $meta = Get-ExtensionStoreMetadata $item.ExtId
+
+        # Merge Logic
+        $finalName = if ($meta.Name) { $meta.Name } else { "$($item.LocalName) (Local)" }
+        $desc      = if ($meta.Description) { $meta.Description } else { "No online description found." }
+        $source    = if ($meta.Source) { $meta.Source } else { "Local Only" }
+        $link      = if ($meta.StoreUrl) { $meta.StoreUrl } else { "" }
+
+        [void]$finalReport.Add([pscustomobject]@{
+            User        = $item.User
+            Browser     = $item.Browser
+            Profile     = $item.Profile
+            Name        = $finalName
+            Version     = $item.Version
+            Source      = $source
+            Link        = $link
+            Description = $desc
+        })
+        Write-Host " -> Done ($source)" -ForegroundColor Gray
+    }
+
+    # Generate HTML
+    $htmlPath = Join-Path $scriptDir "BrowserExtensions_Report.html"
+    $htmlHeader = @"
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset='utf-8'>
+<style>
+body { font-family: Segoe UI, sans-serif; font-size: 13px; }
+table { border-collapse: collapse; width: 100%; margin-top: 10px; }
+th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+th { background-color: #f2f2f2; }
+tr:nth-child(even) { background-color: #f9f9f9; }
+a { text-decoration: none; color: #0078D7; }
+</style>
+</head>
+<body>
+<h2>Browser Extensions Report (Offline Analysis)</h2>
+<small>Generated: $(Get-Date)</small>
+<table>
+<thead>
+<tr>
+    <th>User</th>
+    <th>Browser</th>
+    <th>Profile</th>
+    <th>Extension Name</th>
+    <th>Version</th>
+    <th>Source</th>
+    <th>ID / Link</th>
+</tr>
+</thead>
+<tbody>
+"@
+
+    $rows = foreach ($r in $finalReport) {
+        $href = if ($r.Link) { "<a href='$($r.Link)' target='_blank'>ID</a>" } else { "ID" }
+        "<tr>
+            <td>$($r.User)</td>
+            <td>$($r.Browser)</td>
+            <td>$($r.Profile)</td>
+            <td><b>$($r.Name)</b><br><small>$($r.Description)</small></td>
+            <td>$($r.Version)</td>
+            <td>$($r.Source)</td>
+            <td>$href</td>
+        </tr>"
+    }
+
+    $htmlContent = $htmlHeader + ($rows -join "`r`n") + "</tbody></table></body></html>"
+    $htmlContent | Set-Content -LiteralPath $htmlPath -Encoding UTF8
+
+    Write-Host "`nReport generated: $htmlPath" -ForegroundColor Green
+    Invoke-Item $htmlPath
+}
