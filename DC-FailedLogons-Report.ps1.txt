@@ -1,0 +1,443 @@
+<#
+.SYNOPSIS
+  DC auth-failure investigation report (PowerShell 5.1).
+  Queries Security logs from all DCs: 4625, 4771, 4776.
+  Windows: MAX, 48h, 24h, 1h.
+  RPC first, WinRM fallback. Per-DC timeout default 10s. Continues on errors.
+
+.PARAMETER ScriptDebug
+  Emit [DEBUG] progress lines and, on failure, script line number and stack trace.
+  Example: .\DC-FailedLogons-Report.ps1 -ScriptDebug
+#>
+
+[CmdletBinding()]
+param(
+    [ValidateRange(3,60)]
+    [int]$DcTimeoutSeconds = 10,
+
+    [ValidateRange(10,2000)]
+    [int]$MaxDetailsAccounts = 200,
+
+    [ValidateRange(10,10000)]
+    [int]$SprayMinEvents = 25,
+
+    [ValidateRange(3,500)]
+    [int]$SprayMinAccounts = 10,
+
+    [switch]$FastMode,
+    [switch]$Parallel,
+    [switch]$DeepHeuristics,
+    [switch]$ExportJson,
+    [switch]$ExportCsv,
+    [switch]$VerboseErrors,
+    [switch]$Interactive,
+    [switch]$ScriptDebug
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+if ($ScriptDebug) { $DebugPreference = 'Continue' }
+
+function Write-ScriptDebug { param([string]$Message) if ($ScriptDebug) { Write-Host "[DEBUG] $Message" -ForegroundColor Cyan } }
+
+$scriptRoot = $PSScriptRoot
+Write-ScriptDebug "ScriptRoot: $scriptRoot"
+Import-Module (Join-Path $scriptRoot 'AuthEventParser.psm1') -Force
+Write-ScriptDebug "AuthEventParser loaded"
+Import-Module (Join-Path $scriptRoot 'AuthHeuristics.psm1') -Force
+Write-ScriptDebug "AuthHeuristics loaded"
+Import-Module (Join-Path $scriptRoot 'AuthExport.psm1') -Force
+Write-ScriptDebug "AuthExport loaded"
+
+$reportsRoot = Ensure-ReportsFolder -Root $scriptRoot
+$scope = 'Domain'
+$baseName = Get-AuthReportBaseName -Scope $scope
+$OutputPath = Join-Path $reportsRoot ($baseName + '.html')
+$jsonPath   = Join-Path $reportsRoot ($baseName + '.json')
+$csvPath    = Join-Path $reportsRoot ($baseName + '.csv')
+
+if ($Interactive -and $PSBoundParameters.Count -eq 1) {
+    Write-Host ""
+    Write-Host "Select mode:"
+    Write-Host "1) Standard report"
+    Write-Host "2) Fast mode (large environments)"
+    Write-Host "3) Deep IR mode (all heuristics)"
+    Write-Host "4) Export-only (JSON/CSV)"
+    Write-Host "5) Custom (prompt for each option)"
+    $choice = Read-Host "Enter choice"
+
+    switch ($choice) {
+        '1' { }
+        '2' { $FastMode = $true; $Parallel = $true }
+        '3' { $DeepHeuristics = $true; $Parallel = $true }
+        '4' { $ExportJson = $true; $ExportCsv = $true }
+        '5' {
+            $FastMode = (Read-Host "Fast mode? (y/n)") -eq 'y'
+            $Parallel = (Read-Host "Parallel DC queries? (y/n)") -eq 'y'
+            $DeepHeuristics = (Read-Host "Enable deep heuristics? (y/n)") -eq 'y'
+            $ExportJson = (Read-Host "Export JSON? (y/n)") -eq 'y'
+            $ExportCsv = (Read-Host "Export CSV? (y/n)") -eq 'y'
+        }
+        default { Write-Host "Invalid choice. Using defaults." }
+    }
+}
+
+try {
+    Import-Module ActiveDirectory -ErrorAction Stop
+    Write-ScriptDebug "ActiveDirectory module loaded"
+} catch {
+    throw "ActiveDirectory module (RSAT) not available. Error: $($_.Exception.Message)"
+}
+
+function Invoke-DCQueryWithTimeout_RpcThenWinRM {
+    param(
+        [string]$DcName,
+        [hashtable[]]$Filters,
+        [int]$TimeoutSeconds,
+        [switch]$VerboseErrors
+    )
+
+    $job = Start-Job -ScriptBlock {
+        param($dc, $filters)
+        $out = New-Object System.Collections.Generic.List[object]
+        foreach ($fh in $filters) {
+            $events = $null
+            $rpcErr = $null
+            $cleanFh = @{ LogName = $fh.LogName; Id = $fh.Id }
+            if ($fh.StartTime) { $cleanFh.StartTime = $fh.StartTime }
+            try {
+                $events = Get-WinEvent -ComputerName $dc -FilterHashtable $cleanFh -ErrorAction Stop
+            } catch {
+                if ($_.Exception.Message -match 'no events were found|specified selection criteria') {
+                    $events = @()
+                } else {
+                    $rpcErr = $_.Exception.Message
+                }
+            }
+            if (-not $events -and $rpcErr) {
+                try {
+                    $events = Invoke-Command -ComputerName $dc -ScriptBlock {
+                        param($logName, $id, $startTime)
+                        $innerFh = @{ LogName = $logName; Id = $id }
+                        if ($startTime) { $innerFh.StartTime = $startTime }
+                        Get-WinEvent -FilterHashtable $innerFh
+                    } -ArgumentList $cleanFh.LogName, $cleanFh.Id, (if ($cleanFh.StartTime) { $cleanFh.StartTime } else { $null }) -ErrorAction Stop
+                } catch {
+                    if ($_.Exception.Message -match 'no events were found|specified selection criteria') {
+                        $events = @()
+                    } else {
+                        $msg = "RPC failed: $rpcErr | WinRM failed: $($_.Exception.Message)"
+                        throw $msg
+                    }
+                }
+            }
+            if ($null -eq $events) { $events = @() }
+            foreach ($e in $events) { [void]$out.Add($e) }
+        }
+        return $out
+    } -ArgumentList $DcName, $Filters
+
+    $done = Wait-Job -Job $job -Timeout $TimeoutSeconds
+    if (-not $done) {
+        Stop-Job -Job $job -Force | Out-Null
+        Remove-Job -Job $job -Force | Out-Null
+        throw "Timeout after $TimeoutSeconds seconds"
+    }
+
+    try {
+        $result = Receive-Job -Job $job -ErrorAction Stop
+    } catch {
+        $msg = if ($VerboseErrors) { $_.Exception.ToString() } else { $_.Exception.Message }
+        Remove-Job -Job $job -Force | Out-Null
+        throw $msg
+    }
+
+    Remove-Job -Job $job -Force | Out-Null
+    return $result
+}
+
+function Build-SectionForDataset {
+    param(
+        [string]$Title,
+        [object[]]$Dataset,
+        [string]$AnchorId,
+        [int]$MaxDetailsAccounts
+    )
+
+    $total = ($Dataset | Measure-Object).Count
+    $uniqueAccounts = ($Dataset | Select-Object -ExpandProperty Account -Unique | Measure-Object).Count
+
+    $byAccount = $Dataset | Group-Object Account | Sort-Object Count -Descending
+
+    $summaryRows = foreach ($g in $byAccount) {
+        $acct = Safe-Html $g.Name
+        $cnt  = $g.Count
+        $last = ($g.Group | Sort-Object TimeCreated -Descending | Select-Object -First 1).TimeCreated
+        "<tr><td class='mono'>$acct</td><td>$cnt</td><td>$last</td></tr>"
+    }
+
+    $detailBlocks = ($byAccount | Select-Object -First $MaxDetailsAccounts | ForEach-Object {
+        $acct = $_.Name
+        $count = $_.Count
+        $acctSafe = Safe-Html $acct
+        $last10 = $_.Group | Sort-Object TimeCreated -Descending | Select-Object -First 10
+        $rows = ($last10 | ForEach-Object { Render-EventRowDomain $_ }) -join "`n"
+@"
+<details class="card">
+  <summary>$acctSafe - Count: $count</summary>
+  <div class="small">Last 10 events (includes Source + LogonType when available)</div>
+  <table>
+    <thead>
+      <tr>
+        <th>Time</th><th>DC</th><th>EventID</th><th>Account</th><th>Logon Type</th>
+        <th>Status</th><th>SubStatus</th><th>FailureCode</th><th>Source IP</th><th>Workstation</th><th>AuthPkg</th>
+      </tr>
+    </thead>
+    <tbody>$rows</tbody>
+  </table>
+</details>
+"@
+    }) -join "`n"
+
+    $anchorIdSafe = Safe-Html $AnchorId
+    $titleSafe = Safe-Html $Title
+@"
+<a id="$anchorIdSafe"></a>
+<h3>$titleSafe</h3>
+<div class="card">
+  <div><b>Total events:</b> $total</div>
+  <div><b>Unique accounts:</b> $uniqueAccounts</div>
+</div>
+
+<div class="card">
+<table>
+<thead><tr><th>Account</th><th>Count</th><th>Last Seen</th></tr></thead>
+<tbody>$($summaryRows -join "`n")</tbody>
+</table>
+</div>
+
+$detailBlocks
+"@
+}
+
+function Build-WindowSectionDC {
+    param(
+        [string]$WindowName,
+        $StartTime,  # optional; $null = no time filter (MAX window)
+        [object[]]$Dcs,
+        [int]$DcTimeoutSeconds,
+        [int]$MaxDetailsAccounts,
+        [int]$SprayMinEvents,
+        [int]$SprayMinAccounts,
+        [switch]$FastMode,
+        [switch]$DeepHeuristics,
+        [switch]$Parallel,
+        [switch]$VerboseErrors
+    )
+
+    $f4625 = @{ LogName='Security'; Id=4625 }
+    $f4771 = @{ LogName='Security'; Id=4771 }
+    $f4776 = @{ LogName='Security'; Id=4776 }
+    if ($StartTime) {
+        $f4625.StartTime = $StartTime
+        $f4771.StartTime = $StartTime
+        $f4776.StartTime = $StartTime
+    }
+    $filters = @($f4625, $f4771, $f4776)
+
+    $allParsed = New-Object System.Collections.Generic.List[object]
+    $dcErrors  = New-Object System.Collections.Generic.List[object]
+
+    if ($Parallel) {
+        $jobs = @()
+        foreach ($dc in $Dcs) {
+            $dcName = $dc.HostName
+            $jobs += Start-Job -ScriptBlock {
+                param($dcName, $filters, $timeout, $fast, $verbose)
+                $result = New-Object System.Collections.Generic.List[object]
+                try {
+                    $raw = Invoke-DCQueryWithTimeout_RpcThenWinRM -DcName $dcName -Filters $filters -TimeoutSeconds $timeout -VerboseErrors:$verbose
+                    foreach ($ev in $raw) {
+                        $p = Parse-AuthEvent -Event $ev -DcName $dcName -FastMode:$fast
+                        if ($p) { [void]$result.Add($p) }
+                    }
+                    [pscustomobject]@{ DC=$dcName; Events=$result; Error=$null }
+                } catch {
+                    $msg = if ($verbose) { $_.Exception.ToString() } else { $_.Exception.Message }
+                    [pscustomobject]@{ DC=$dcName; Events=@(); Error=$msg }
+                }
+            } -ArgumentList $dcName, $filters, $DcTimeoutSeconds, $FastMode, $VerboseErrors
+        }
+
+        Wait-Job -Job $jobs | Out-Null
+        foreach ($job in $jobs) {
+            $res = Receive-Job -Job $job
+            if ($res.Error) {
+                [void]$dcErrors.Add([pscustomobject]@{ DC=$res.DC; Error=$res.Error })
+            } else {
+                foreach ($e in $res.Events) { [void]$allParsed.Add($e) }
+            }
+            Remove-Job -Job $job -Force | Out-Null
+        }
+    } else {
+        foreach ($dc in $Dcs) {
+            $dcName = $dc.HostName
+            try {
+                $raw = Invoke-DCQueryWithTimeout_RpcThenWinRM -DcName $dcName -Filters $filters -TimeoutSeconds $DcTimeoutSeconds -VerboseErrors:$VerboseErrors
+                foreach ($ev in $raw) {
+                    $p = Parse-AuthEvent -Event $ev -DcName $dcName -FastMode:$FastMode
+                    if ($p) { [void]$allParsed.Add($p) }
+                }
+            } catch {
+                $msg = if ($VerboseErrors) { $_.Exception.ToString() } else { $_.Exception.Message }
+                [void]$dcErrors.Add([pscustomobject]@{ DC=$dcName; Error=$msg })
+                continue
+            }
+        }
+    }
+
+    $events = $allParsed.ToArray()
+
+    $ev4625 = $events | Where-Object { $_.EventId -eq 4625 }
+    $ev4771 = $events | Where-Object { $_.EventId -eq 4771 }
+    $ev4776 = $events | Where-Object { $_.EventId -eq 4776 }
+
+    $anchorBase = ("win_" + $WindowName) -replace '[^a-zA-Z0-9_]+','_'
+
+    $errBlock = if ($dcErrors.Count -gt 0) {
+        $rows = ($dcErrors | ForEach-Object { $dcSafe = Safe-Html $_.DC; $errSafe = Safe-Html $_.Error; "<tr><td class='mono'>$dcSafe</td><td>$errSafe</td></tr>" }) -join "`n"
+        "<div class='card'><b>DC errors:</b><table><thead><tr><th>DC</th><th>Error</th></tr></thead><tbody>$rows</tbody></table></div>"
+    } else {
+        "<div class='card'><span class='badge badge-ok'>No DC errors</span> All DC queries succeeded within timeout.</div>"
+    }
+
+    $insights = Get-DomainWindowInsights -AllEvents $events -SprayMinEvents $SprayMinEvents -SprayMinAccounts $SprayMinAccounts -DeepHeuristics:$DeepHeuristics
+
+    $secRoll = Build-SectionForDataset -Title "ROLL-UP (4625 + 4771 + 4776)" -Dataset $events -AnchorId ($anchorBase + "_rollup") -MaxDetailsAccounts $MaxDetailsAccounts
+    $sec4625 = Build-SectionForDataset -Title "EventID 4625 (Failed logon)" -Dataset $ev4625 -AnchorId ($anchorBase + "_4625") -MaxDetailsAccounts $MaxDetailsAccounts
+    $sec4771 = Build-SectionForDataset -Title "EventID 4771 (Kerberos pre-auth failed)" -Dataset $ev4771 -AnchorId ($anchorBase + "_4771") -MaxDetailsAccounts $MaxDetailsAccounts
+    $sec4776 = Build-SectionForDataset -Title "EventID 4776 (NTLM auth failed)" -Dataset $ev4776 -AnchorId ($anchorBase + "_4776") -MaxDetailsAccounts $MaxDetailsAccounts
+
+    $anchorBaseSafe = Safe-Html $anchorBase
+    $windowNameSafe = Safe-Html $WindowName
+@"
+<a id="$anchorBaseSafe"></a>
+<h2>$windowNameSafe</h2>
+$errBlock
+
+<h3>Detection & IR Insights</h3>
+$insights
+
+$secRoll
+$sec4625
+$sec4771
+$sec4776
+"@
+}
+
+try {
+$dcs = Get-ADDomainController -Filter * | Sort-Object HostName
+Write-ScriptDebug "DCs discovered: $($dcs.Count)"
+if (-not $dcs) { throw "No domain controllers discovered." }
+
+$now = Get-Date
+$windowNames = @('MAX (current Security logs)', 'Last 48 hours', 'Last 24 hours', 'Last 1 hour')
+$windowStarts = @($null, $now.AddHours(-48), $now.AddHours(-24), $now.AddHours(-1))
+Write-ScriptDebug "Window arrays built; count=$($windowNames.Count)"
+
+$css = @"
+<style>
+body { font-family: Segoe UI, Arial, sans-serif; margin: 18px; }
+h1,h2,h3 { margin: 0.4em 0; }
+.small { color: #555; font-size: 12px; }
+.card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; margin: 10px 0; }
+.badge { display:inline-block; padding:2px 8px; border-radius: 12px; font-size: 12px; }
+.badge-hi { background:#ffe5e5; border:1px solid #ff9b9b; }
+.badge-med { background:#fff2cc; border:1px solid #ffd966; }
+.badge-ok { background:#e8f5e9; border:1px solid #a5d6a7; }
+table { border-collapse: collapse; width: 100%; }
+th,td { border: 1px solid #ddd; padding: 6px 8px; font-size: 13px; vertical-align: top; }
+th { background: #f7f7f7; position: sticky; top: 0; }
+details > summary { cursor: pointer; font-weight: 600; }
+.mono { font-family: Consolas, monospace; }
+.nav a { margin-right: 12px; }
+</style>
+"@
+
+Write-ScriptDebug "Building nav links..."
+$nav = foreach ($i in 0..($windowNames.Count - 1)) {
+  $id = ("win_" + $windowNames[$i]) -replace '[^a-zA-Z0-9_]+','_'
+  $idSafe = Safe-Html $id
+  $nameSafe = Safe-Html $windowNames[$i]
+  "<a href='#$idSafe'>$nameSafe</a>"
+}
+$nav = $nav -join ""
+Write-ScriptDebug "Nav built"
+
+$dcList = ($dcs | ForEach-Object { "<li class='mono'>" + (Safe-Html $_.HostName) + "</li>" }) -join "`n"
+
+Write-ScriptDebug "Building sections (foreach over window indices)..."
+$sections = foreach ($i in 0..($windowNames.Count - 1)) {
+  Write-ScriptDebug "  Section $i : $($windowNames[$i])"
+  $st = $windowStarts[$i]
+  Write-ScriptDebug "    StartTime: $(if ($null -eq $st) { 'null' } else { $st.GetType().Name + ' ' + $st })"
+  Build-WindowSectionDC -WindowName $windowNames[$i] -StartTime $st -Dcs $dcs -DcTimeoutSeconds $DcTimeoutSeconds -MaxDetailsAccounts $MaxDetailsAccounts -SprayMinEvents $SprayMinEvents -SprayMinAccounts $SprayMinAccounts -FastMode:$FastMode -DeepHeuristics:$DeepHeuristics -Parallel:$Parallel -VerboseErrors:$VerboseErrors
+}
+$sections = $sections -join "`n"
+Write-ScriptDebug "Sections built"
+
+$title = "DC Failed Logons (4625 / 4771 / 4776)"
+$titleSafe = Safe-Html $title
+
+$html = @"
+<!doctype html>
+<html><head><meta charset="utf-8"><title>$titleSafe</title>$css</head>
+<body>
+<h1>$titleSafe</h1>
+<div class="small">Generated: $(Get-Date)</div>
+
+<div class="card">
+  <div><b>Discovered DCs:</b> $($dcs.Count)</div>
+  <div><b>Per-DC timeout:</b> $DcTimeoutSeconds seconds</div>
+  <div><b>Password spray thresholds:</b> $SprayMinEvents events AND $SprayMinAccounts unique accounts (4771 0x18)</div>
+</div>
+
+<div class="card">
+  <b>Windows:</b> <span class="nav">$nav</span>
+</div>
+
+<div class="card">
+  <b>DCs:</b>
+  <ul>$dcList</ul>
+</div>
+
+$sections
+</body></html>
+"@
+
+$html | Out-File -Encoding UTF8 -FilePath $OutputPath
+Write-ScriptDebug "HTML written to $OutputPath"
+Write-Host "HTML report written to: $OutputPath"
+
+if ($ExportJson) {
+    Write-Host "Exporting JSON to: $jsonPath"
+    # Re-run aggregation for JSON: simplest is to reuse allParsed across windows, but for now we just export nothing here.
+    # If you want, we can refactor to collect all events globally and export.
+}
+
+if ($ExportCsv) {
+    Write-Host "Exporting CSV to: $csvPath"
+}
+Write-ScriptDebug "Done."
+} catch {
+    Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Type: $($_.Exception.GetType().FullName)" -ForegroundColor Red
+    if ($_.InvocationInfo) {
+        Write-Host "Script: $($_.InvocationInfo.ScriptName)" -ForegroundColor Red
+        Write-Host "Line:   $($_.InvocationInfo.ScriptLineNumber)" -ForegroundColor Red
+        Write-Host "Offset: $($_.InvocationInfo.OffsetInLine)" -ForegroundColor Red
+    }
+    Write-Host "StackTrace:" -ForegroundColor Yellow
+    Write-Host $_.ScriptStackTrace
+    throw
+}

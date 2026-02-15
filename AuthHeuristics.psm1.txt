@@ -1,0 +1,126 @@
+Set-StrictMode -Version 2.0
+
+Import-Module $PSScriptRoot\AuthEventParser.psm1 -Force
+
+function Get-DomainWindowInsights {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$AllEvents,
+        [int]$SprayMinEvents = 25,
+        [int]$SprayMinAccounts = 10,
+        [switch]$DeepHeuristics
+    )
+
+    $ins = New-Object System.Collections.Generic.List[string]
+
+    # Password spray: 4771 FailureCode 0x18 by Source IP
+    $spray = $AllEvents |
+        Where-Object { $_.EventId -eq 4771 -and $_.FailureCode -eq '0x18' -and $_.SourceIp } |
+        Group-Object SourceIp | ForEach-Object {
+            $uniq = ($_.Group | Select-Object -ExpandProperty Account -Unique).Count
+            [pscustomobject]@{
+                SourceIp = $_.Name
+                Events = $_.Count
+                UniqueAccounts = $uniq
+                LastSeen = ($_.Group | Sort-Object TimeCreated -Descending | Select-Object -First 1).TimeCreated
+            }
+        } | Where-Object { $_.Events -ge $SprayMinEvents -and $_.UniqueAccounts -ge $SprayMinAccounts } |
+        Sort-Object Events -Descending
+
+    if ($spray) {
+        $rows = ($spray | Select-Object -First 50 | ForEach-Object {
+            $srcSafe = Safe-Html $_.SourceIp
+            "<tr><td class='mono'>$srcSafe</td><td>$($_.Events)</td><td>$($_.UniqueAccounts)</td><td>$($_.LastSeen)</td></tr>"
+        }) -join "`n"
+
+        $ins.Add(@"
+<div class='card'>
+  <span class='badge badge-hi'>Password spray hint</span>
+  Multiple 4771 with FailureCode 0x18 from same source IP (>= $SprayMinEvents events AND >= $SprayMinAccounts unique accounts).
+  <table>
+    <thead><tr><th>Source IP</th><th>Events</th><th>Unique Accounts</th><th>Last Seen</th></tr></thead>
+    <tbody>$rows</tbody>
+  </table>
+</div>
+"@)
+    }
+
+    # Brute force: multiple 4625 on same account
+    $brute = ($AllEvents | Where-Object { $_.EventId -eq 4625 } | Group-Object Account | Where-Object { $_.Count -ge 10 } | Sort-Object Count -Descending)
+    if ($brute) {
+        $items = ($brute | Select-Object -First 50 | ForEach-Object { "<li class='mono'>" + (Safe-Html $_.Name) + " - " + $_.Count + "</li>" }) -join ""
+        $ins.Add("<div class='card'><span class='badge badge-med'>Brute force hint</span> Multiple 4625 failures per account (>=10).<ul>$items</ul></div>")
+    }
+
+    # Account enumeration: 4625 0xC0000064
+    $enum = $AllEvents | Where-Object { $_.EventId -eq 4625 -and ( $_.Status -eq '0xC0000064' -or $_.SubStatus -eq '0xC0000064' ) }
+    if ($enum) {
+        $ins.Add("<div class='card'><span class='badge badge-med'>Account enumeration hint</span> 4625 with 0xC0000064: <b>$($enum.Count)</b> events.</div>")
+    }
+
+    # Lateral movement hints:
+    $lat4625 = $AllEvents | Where-Object { $_.EventId -eq 4625 -and $_.LogonType -eq 3 -and (Test-InternalIP $_.SourceIp) }
+    if ($lat4625) {
+        $ins.Add("<div class='card'><span class='badge badge-med'>Lateral movement hint</span> 4625 LogonType 3 from internal IPs: <b>$($lat4625.Count)</b> events.</div>")
+    }
+
+    $lat4776 = $AllEvents | Where-Object { $_.EventId -eq 4776 -and $_.Account -match '\\.*\$$' -and $_.WorkstationName }
+    if ($lat4776) {
+        $ins.Add("<div class='card'><span class='badge badge-med'>Lateral movement hint</span> 4776 NTLM failures involving machine accounts (heuristic): <b>$($lat4776.Count)</b> events.</div>")
+    }
+
+    if ($DeepHeuristics) {
+        $total = $AllEvents.Count
+        $ntlm  = ($AllEvents | Where-Object { $_.EventId -eq 4776 }).Count
+        $kerb  = ($AllEvents | Where-Object { $_.EventId -eq 4771 }).Count
+        if ($total -gt 0) {
+            $ratio = [math]::Round(($ntlm / $total) * 100, 2)
+            $ins.Add("<div class='card'><span class='badge badge-med'>NTLM ratio</span> NTLM failures (4776) are <b>$ratio%</b> of all failures in this window.</div>")
+        }
+        if ($kerb -eq 0) {
+            $ins.Add("<div class='card'><span class='badge badge-med'>Kerberos health hint</span> No 4771 events observed in this window. Verify DC Kerberos health and logging.</div>")
+        }
+    }
+
+    if ($ins.Count -eq 0) {
+        $ins.Add("<div class='card'><span class='badge badge-ok'>No insights triggered</span> None of the configured heuristics crossed thresholds.</div>")
+    }
+
+    return ($ins -join "`n")
+}
+
+function Get-LocalWindowInsights {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Events
+    )
+
+    $ins = @()
+
+    $bruteforce = ($Events | Group-Object Account | Where-Object { $_.Count -ge 10 } | Sort-Object Count -Descending)
+    $enumeration = $Events | Where-Object { $_.Status -eq '0xC0000064' -or $_.SubStatus -eq '0xC0000064' }
+    $lateralType3Internal = $Events | Where-Object { $_.LogonType -eq 3 -and (Test-InternalIP $_.SourceIp) }
+
+    if ($bruteforce) {
+        $items = ($bruteforce | Select-Object -First 50 | ForEach-Object { "<li class='mono'>" + (Safe-Html $_.Name) + " - " + $_.Count + "</li>" }) -join ""
+        $ins += "<div class='card'><span class='badge badge-med'>Brute force hint</span> Multiple 4625 failures per account (>=10).<ul>$items</ul></div>"
+    }
+    if ($enumeration) {
+        $ins += "<div class='card'><span class='badge badge-med'>Account enumeration hint</span> 4625 with 0xC0000064 (user does not exist): <b>$($enumeration.Count)</b> events.</div>"
+    }
+    if ($lateralType3Internal) {
+        $ins += "<div class='card'><span class='badge badge-med'>Lateral movement hint</span> 4625 LogonType 3 from internal IPs: <b>$($lateralType3Internal.Count)</b> events.</div>"
+    }
+
+    if (-not $ins) {
+        $ins += "<div class='card'><span class='badge badge-ok'>No insights triggered</span> None of the configured heuristics crossed thresholds.</div>"
+    }
+
+    return ($ins -join "`n")
+}
+
+Export-ModuleMember -Function *-*

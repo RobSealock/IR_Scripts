@@ -1,0 +1,43 @@
+Set-StrictMode -Version 2.0
+
+function Get-AuthTimestamp {
+    Get-Date -Format 'yyyyMMdd_HHmmss'
+}
+
+function Get-AuthReportBaseName {
+    param(
+        [Parameter(Mandatory)][string]$Scope # 'Local' or 'Domain'
+    )
+    $computerName = $env:COMPUTERNAME
+    $ts   = Get-AuthTimestamp
+    return "{0}_{1}_{2}" -f $computerName, $Scope, $ts
+}
+
+function Ensure-ReportsFolder {
+    param(
+        [Parameter(Mandatory)][string]$Root
+    )
+    $reports = Join-Path $Root 'reports'
+    if (-not (Test-Path $reports)) {
+        New-Item -ItemType Directory -Path $reports | Out-Null
+    }
+    return $reports
+}
+
+function Export-AuthJson {
+    param(
+        [Parameter(Mandatory)][object[]]$Events,
+        [Parameter(Mandatory)][string]$Path
+    )
+    $Events | ConvertTo-Json -Depth 6 | Out-File -FilePath $Path -Encoding UTF8
+}
+
+function Export-AuthCsv {
+    param(
+        [Parameter(Mandatory)][object[]]$Events,
+        [Parameter(Mandatory)][string]$Path
+    )
+    $Events | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
+}
+
+Export-ModuleMember -Function *-*

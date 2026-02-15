@@ -1,0 +1,110 @@
+<#
+.SYNOPSIS
+  Quick test: can this account read Security log (4625/4771/4776) on local and remote DCs?
+  Run on a DC or any machine with RSAT. Uses same methods as DC-FailedLogons-Report.ps1.
+#>
+[CmdletBinding()]
+param(
+    [int]$MaxEvents = 1,
+    [switch]$UseWinRM
+)
+
+$ErrorActionPreference = 'Stop'
+$logName = 'Security'
+$ids = @(4625, 4771, 4776)
+
+Write-Host "Testing Security log access (IDs: $($ids -join ', '))" -ForegroundColor Cyan
+Write-Host ""
+
+# Get DCs
+try {
+    Import-Module ActiveDirectory -ErrorAction Stop
+} catch {
+    Write-Host "ERROR: ActiveDirectory module not available. $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
+}
+
+$dcs = Get-ADDomainController -Filter * | Sort-Object HostName
+if (-not $dcs) {
+    Write-Host "No domain controllers found." -ForegroundColor Red
+    exit 1
+}
+
+$results = @()
+foreach ($dc in $dcs) {
+    $name = $dc.HostName
+    $shortName = ($name -split '\.')[0]
+    $isLocal = ($name -eq $env:COMPUTERNAME) -or ($shortName -eq $env:COMPUTERNAME)
+    $label = if ($isLocal) { "$name (local)" } else { "$name (remote)" }
+
+    foreach ($id in $ids) {
+        $ok = $false
+        $err = $null
+        $method = 'RPC'
+        try {
+            if ($UseWinRM -and -not $isLocal) {
+                $events = Invoke-Command -ComputerName $name -ScriptBlock {
+                    param($log, $eventId, $max)
+                    Get-WinEvent -FilterHashtable @{ LogName = $log; Id = $eventId } -MaxEvents $max -ErrorAction Stop
+                } -ArgumentList $logName, $id, $MaxEvents -ErrorAction Stop
+                $method = 'WinRM'
+                $ok = $true
+            } else {
+                $events = Get-WinEvent -ComputerName $name -FilterHashtable @{ LogName = $logName; Id = $id } -MaxEvents $MaxEvents -ErrorAction Stop
+                $ok = $true
+            }
+        } catch {
+            if ($_.Exception.Message -match 'no events were found|specified selection criteria') {
+                $ok = $true
+                $err = '(no events in log)'
+            } elseif ($_.Exception.Message -match 'RPC server is unavailable|RPC server unavailable') {
+                $rpcErr = $_.Exception.Message
+                if (-not $isLocal) {
+                    try {
+                        $null = Invoke-Command -ComputerName $name -ScriptBlock {
+                            param($log, $eventId, $max)
+                            Get-WinEvent -FilterHashtable @{ LogName = $log; Id = $eventId } -MaxEvents $max -ErrorAction Stop
+                        } -ArgumentList $logName, $id, $MaxEvents -ErrorAction Stop
+                        $ok = $true
+                        $err = 'OK via WinRM (RPC unavailable)'
+                        $method = 'WinRM'
+                    } catch {
+                        if ($_.Exception.Message -match 'no events were found|specified selection criteria') {
+                            $ok = $true
+                            $err = 'OK via WinRM (no events)'
+                            $method = 'WinRM'
+                        } else {
+                            $err = "RPC: $rpcErr | WinRM: $($_.Exception.Message)"
+                        }
+                    }
+                } else {
+                    $err = $rpcErr
+                }
+            } else {
+                $err = $_.Exception.Message
+            }
+        }
+        $results += [pscustomobject]@{
+            DC       = $label
+            EventId  = $id
+            Access   = if ($ok) { 'OK' } else { 'FAIL' }
+            Message  = $err
+        }
+    }
+}
+
+# Report
+$results | Format-Table -AutoSize
+$fail = $results | Where-Object { $_.Access -eq 'FAIL' }
+$winrmFallback = $results | Where-Object { $_.Message -match 'OK via WinRM' }
+if ($fail) {
+    Write-Host "One or more checks failed (see FAIL above)." -ForegroundColor Red
+    exit 1
+}
+if ($winrmFallback) {
+    Write-Host "All checks passed. Some remote DCs used WinRM because RPC was unavailable." -ForegroundColor Green
+    Write-Host "DC-FailedLogons-Report.ps1 will use the same WinRM fallback for those DCs." -ForegroundColor Gray
+} else {
+    Write-Host "All checks passed (OK or no events)." -ForegroundColor Green
+}
+exit 0

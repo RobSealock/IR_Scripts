@@ -1,0 +1,262 @@
+<#
+.SYNOPSIS
+  Local failed logon report (PowerShell 5.1) from Security log.
+  Generates a single HTML report with 4 windows: MAX, 48h, 24h, 1h.
+  Focus: 4625, with optional 4771/4776.
+
+.PARAMETER ScriptDebug
+  Emit [DEBUG] progress lines and, on failure, script line number and stack trace.
+  Example: .\Local-FailedLogons-Report.ps1 -ScriptDebug
+#>
+
+[CmdletBinding()]
+param(
+    [ValidateRange(10,2000)]
+    [int]$MaxDetailsAccounts = 200,
+
+    [switch]$FastMode,
+    [switch]$IncludeNTLMKerbLocal,
+    [switch]$ExportJson,
+    [switch]$ExportCsv,
+    [switch]$VerboseErrors,
+    [switch]$Interactive,
+    [switch]$ScriptDebug
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+if ($ScriptDebug) { $DebugPreference = 'Continue' }
+
+function Write-ScriptDebug { param([string]$Message) if ($ScriptDebug) { Write-Host "[DEBUG] $Message" -ForegroundColor Cyan } }
+
+$scriptRoot = $PSScriptRoot
+Write-ScriptDebug "ScriptRoot: $scriptRoot"
+Import-Module (Join-Path $scriptRoot 'AuthEventParser.psm1') -Force
+Write-ScriptDebug "AuthEventParser loaded"
+Import-Module (Join-Path $scriptRoot 'AuthHeuristics.psm1') -Force
+Write-ScriptDebug "AuthHeuristics loaded"
+Import-Module (Join-Path $scriptRoot 'AuthExport.psm1') -Force
+Write-ScriptDebug "AuthExport loaded"
+
+$reportsRoot = Ensure-ReportsFolder -Root $scriptRoot
+$scope = 'Local'
+$baseName = Get-AuthReportBaseName -Scope $scope
+$OutputPath = Join-Path $reportsRoot ($baseName + '.html')
+$jsonPath   = Join-Path $reportsRoot ($baseName + '.json')
+$csvPath    = Join-Path $reportsRoot ($baseName + '.csv')
+
+if ($Interactive -and $PSBoundParameters.Count -eq 1) {
+    Write-Host ""
+    Write-Host "Select mode:"
+    Write-Host "1) Standard report"
+    Write-Host "2) Fast mode"
+    Write-Host "3) Include NTLM/Kerberos (4771/4776)"
+    Write-Host "4) Export-only (JSON/CSV)"
+    Write-Host "5) Custom (prompt for each option)"
+    $choice = Read-Host "Enter choice"
+
+    switch ($choice) {
+        '1' { }
+        '2' { $FastMode = $true }
+        '3' { $IncludeNTLMKerbLocal = $true }
+        '4' { $ExportJson = $true; $ExportCsv = $true }
+        '5' {
+            $FastMode = (Read-Host "Fast mode? (y/n)") -eq 'y'
+            $IncludeNTLMKerbLocal = (Read-Host "Include 4771/4776? (y/n)") -eq 'y'
+            $ExportJson = (Read-Host "Export JSON? (y/n)") -eq 'y'
+            $ExportCsv = (Read-Host "Export CSV? (y/n)") -eq 'y'
+        }
+        default { Write-Host "Invalid choice. Using defaults." }
+    }
+}
+
+function Get-EventsLocal {
+    param(
+        $StartTime,  # optional; $null = no time filter (MAX window)
+        [switch]$IncludeNTLMKerbLocal
+    )
+
+    $fh4625 = @{ LogName='Security'; Id=4625 }
+    if ($StartTime) { $fh4625.StartTime = $StartTime }
+    $raw4625 = Get-WinEvent -FilterHashtable $fh4625
+    if ($ScriptDebug) { $c = (($raw4625 | Measure-Object).Count); Write-Host "[DEBUG] Get-EventsLocal: raw 4625 count = $c" -ForegroundColor Cyan }
+
+    $events = New-Object System.Collections.Generic.List[object]
+    foreach ($ev in $raw4625) {
+        $p = Parse-4625Local -Event $ev -FastMode:$FastMode
+        if ($p) { [void]$events.Add($p) }
+    }
+
+    if ($IncludeNTLMKerbLocal) {
+        $fh4771 = @{ LogName='Security'; Id=4771 }
+        $fh4776 = @{ LogName='Security'; Id=4776 }
+        if ($StartTime) {
+            $fh4771.StartTime = $StartTime
+            $fh4776.StartTime = $StartTime
+        }
+        $raw4771 = Get-WinEvent -FilterHashtable $fh4771
+        $raw4776 = Get-WinEvent -FilterHashtable $fh4776
+
+        foreach ($ev in $raw4771) {
+            $p = Parse-AuthEvent -Event $ev -DcName $env:COMPUTERNAME -FastMode:$FastMode
+            if ($p) { [void]$events.Add($p) }
+        }
+        foreach ($ev in $raw4776) {
+            $p = Parse-AuthEvent -Event $ev -DcName $env:COMPUTERNAME -FastMode:$FastMode
+            if ($p) { [void]$events.Add($p) }
+        }
+        if ($ScriptDebug) { Write-Host "[DEBUG] Get-EventsLocal: added 4771/4776; total events = $($events.Count)" -ForegroundColor Cyan }
+    }
+
+    if ($ScriptDebug) { Write-Host "[DEBUG] Get-EventsLocal: returning $($events.Count) events" -ForegroundColor Cyan }
+    return $events.ToArray()
+}
+
+function Build-WindowSectionLocal {
+    param(
+        [string]$WindowName,
+        $StartTime,  # optional; $null = no time filter (MAX window)
+        [int]$MaxDetailsAccounts
+    )
+
+    $events = Get-EventsLocal -StartTime $StartTime -IncludeNTLMKerbLocal:$IncludeNTLMKerbLocal
+    if ($ScriptDebug) { $c = ($events | Measure-Object).Count; Write-Host "[DEBUG] Build-WindowSectionLocal ($WindowName): got $c events" -ForegroundColor Cyan }
+
+    $total = ($events | Measure-Object).Count
+    $uniqueAccounts = ($events | Select-Object -ExpandProperty Account -Unique | Measure-Object).Count
+
+    $byAccount = $events | Group-Object Account | Sort-Object Count -Descending
+
+    $summaryRows = foreach ($g in $byAccount) {
+        $acct = Safe-Html $g.Name
+        $cnt  = $g.Count
+        $last = ($g.Group | Sort-Object TimeCreated -Descending | Select-Object -First 1).TimeCreated
+        "<tr><td class='mono'>$acct</td><td>$cnt</td><td>$last</td></tr>"
+    }
+
+    $insights = Get-LocalWindowInsights -Events $events
+    if ($ScriptDebug) { Write-Host "[DEBUG] Build-WindowSectionLocal ($WindowName): insights built, $($byAccount.Count) accounts" -ForegroundColor Cyan }
+
+    $detailBlocks = ($byAccount | Select-Object -First $MaxDetailsAccounts | ForEach-Object {
+        $acct = $_.Name
+        $count = $_.Count
+        $acctSafe = Safe-Html $acct
+        $last10 = $_.Group | Sort-Object TimeCreated -Descending | Select-Object -First 10
+        $rows = ($last10 | ForEach-Object { Render-EventRowLocal $_ }) -join "`n"
+@"
+<details class="card">
+  <summary>$acctSafe - Count: $count</summary>
+  <div class="small">Last 10 failures (includes Source + LogonType)</div>
+  <table>
+    <thead>
+      <tr><th>Time</th><th>Account</th><th>Logon Type</th><th>Status</th><th>SubStatus</th><th>Source</th><th>Workstation</th><th>AuthPkg</th></tr>
+    </thead>
+    <tbody>$rows</tbody>
+  </table>
+</details>
+"@
+    }) -join "`n"
+
+    $windowNameSafe = Safe-Html $WindowName
+@"
+<a id="win_$windowNameSafe"></a>
+<h2>$windowNameSafe</h2>
+<div class="card">
+  <div><b>Total failed events:</b> $total</div>
+  <div><b>Unique accounts:</b> $uniqueAccounts</div>
+</div>
+
+<h3>Summary by Account</h3>
+<div class="card">
+<table>
+<thead><tr><th>Account</th><th>Failed Count</th><th>Last Seen</th></tr></thead>
+<tbody>$($summaryRows -join "`n")</tbody>
+</table>
+</div>
+
+<h3>Detection & IR Insights</h3>
+$insights
+
+<h3>Per-Account Details</h3>
+$detailBlocks
+"@
+}
+
+try {
+$now = Get-Date
+$windowNames = @('MAX (current Security log)', 'Last 48 hours', 'Last 24 hours', 'Last 1 hour')
+$windowStarts = @($null, $now.AddHours(-48), $now.AddHours(-24), $now.AddHours(-1))
+Write-ScriptDebug "Window arrays built; count=$($windowNames.Count)"
+
+$css = @"
+<style>
+body { font-family: Segoe UI, Arial, sans-serif; margin: 18px; }
+h1,h2,h3 { margin: 0.4em 0; }
+.small { color: #555; font-size: 12px; }
+.card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; margin: 10px 0; }
+.badge { display:inline-block; padding:2px 8px; border-radius: 12px; font-size: 12px; }
+.badge-hi { background:#ffe5e5; border:1px solid #ff9b9b; }
+.badge-med { background:#fff2cc; border:1px solid #ffd966; }
+.badge-ok { background:#e8f5e9; border:1px solid #a5d6a7; }
+table { border-collapse: collapse; width: 100%; }
+th,td { border: 1px solid #ddd; padding: 6px 8px; font-size: 13px; vertical-align: top; }
+th { background: #f7f7f7; position: sticky; top: 0; }
+details > summary { cursor: pointer; font-weight: 600; }
+.mono { font-family: Consolas, monospace; }
+.nav a { margin-right: 12px; }
+</style>
+"@
+
+Write-ScriptDebug "Building nav links..."
+$nav = foreach ($i in 0..($windowNames.Count - 1)) {
+  $id = "win_" + $windowNames[$i]
+  $idSafe = Safe-Html $id
+  $nameSafe = Safe-Html $windowNames[$i]
+  "<a href='#$idSafe'>$nameSafe</a>"
+}
+$nav = $nav -join ""
+Write-ScriptDebug "Nav built"
+
+Write-ScriptDebug "Building sections..."
+$sections = foreach ($i in 0..($windowNames.Count - 1)) {
+  Write-ScriptDebug "  Section $i : $($windowNames[$i])"
+  $st = $windowStarts[$i]
+  Write-ScriptDebug "    StartTime: $(if ($null -eq $st) { 'null' } else { $st.GetType().Name + ' ' + $st })"
+  Build-WindowSectionLocal -WindowName $windowNames[$i] -StartTime $st -MaxDetailsAccounts $MaxDetailsAccounts
+}
+$sections = $sections -join "`n"
+Write-ScriptDebug "Sections built"
+
+$title = "Local Failed Logons - $env:COMPUTERNAME"
+$titleSafe = Safe-Html $title
+
+$html = @"
+<!doctype html>
+<html><head><meta charset="utf-8"><title>$titleSafe</title>$css</head>
+<body>
+<h1>$titleSafe</h1>
+<div class="small">Generated: $(Get-Date)</div>
+<div class="card nav"><b>Windows:</b> $nav</div>
+$sections
+</body></html>
+"@
+
+$html | Out-File -Encoding UTF8 -FilePath $OutputPath
+Write-ScriptDebug "HTML written to $OutputPath"
+Write-Host "HTML report written to: $OutputPath"
+
+if ($ExportJson) { Write-Host "Exporting JSON to: $jsonPath" }
+if ($ExportCsv) { Write-Host "Exporting CSV to: $csvPath" }
+Write-ScriptDebug "Done."
+} catch {
+    Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Type: $($_.Exception.GetType().FullName)" -ForegroundColor Red
+    if ($_.InvocationInfo) {
+        Write-Host "Script: $($_.InvocationInfo.ScriptName)" -ForegroundColor Red
+        Write-Host "Line:   $($_.InvocationInfo.ScriptLineNumber)" -ForegroundColor Red
+        Write-Host "Offset: $($_.InvocationInfo.OffsetInLine)" -ForegroundColor Red
+    }
+    Write-Host "StackTrace:" -ForegroundColor Yellow
+    Write-Host $_.ScriptStackTrace
+    throw
+}

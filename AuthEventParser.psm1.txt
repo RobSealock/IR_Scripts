@@ -1,0 +1,275 @@
+Set-StrictMode -Version 2.0
+
+# region Maps
+
+function Get-LogonTypeMap {
+    @{
+        2  = 'Interactive (console)'
+        3  = 'Network (SMB/remote)'
+        4  = 'Batch'
+        5  = 'Service'
+        7  = 'Unlock'
+        8  = 'NetworkCleartext'
+        9  = 'NewCredentials (RunAs)'
+        10 = 'RemoteInteractive (RDP/TS)'
+        11 = 'CachedInteractive'
+    }
+}
+
+function Get-NtStatusMap {
+    @{
+        '0xC0000064' = 'User does not exist'
+        '0xC000006A' = 'Bad password'
+        '0xC000006D' = 'Bad username or authentication information'
+        '0xC000006F' = 'Logon outside allowed hours'
+        '0xC0000070' = 'Workstation restriction'
+        '0xC0000071' = 'Password expired'
+        '0xC0000072' = 'Account disabled'
+        '0xC0000133' = 'Clock skew / time difference'
+        '0xC0000193' = 'Account expired'
+        '0xC0000224' = 'Password must change'
+        '0xC0000234' = 'Account locked'
+    }
+}
+
+function Get-KerbFailureCodeMap {
+    @{
+        '0x18' = 'Pre-auth failed (often bad password)'
+        '0x06' = 'Client not found'
+        '0x12' = 'Account disabled'
+        '0x17' = 'Password expired'
+        '0x20' = 'KDC policy rejected request'
+    }
+}
+
+# endregion
+
+function Safe-Html {
+    param([string]$s)
+    if ($null -eq $s) { return '' }
+    return ($s -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;' -replace '"','&quot;')
+}
+
+function Test-InternalIP {
+    param([string]$Ip)
+    if ([string]::IsNullOrWhiteSpace($Ip)) { return $false }
+    if ($Ip -eq '-' -or $Ip -eq '::1' -or $Ip -eq '127.0.0.1') { return $false }
+    return (
+        $Ip -match '^10\.' -or
+        $Ip -match '^192\.168\.' -or
+        $Ip -match '^172\.(1[6-9]|2\d|3[0-1])\.' -or
+        $Ip -match '^169\.254\.'
+    )
+}
+
+function Parse-AuthEvent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][System.Diagnostics.Eventing.Reader.EventRecord]$Event,
+        [Parameter(Mandatory)][string]$DcName,
+        [switch]$FastMode
+    )
+
+    $logonTypeMap = Get-LogonTypeMap
+    $ntStatusMap  = Get-NtStatusMap
+    $kerbMap      = Get-KerbFailureCodeMap
+
+    $id = $Event.Id
+
+    # Fast mode: try properties first, fall back to XML only if needed
+    $data = @{}
+    if ($FastMode -and $Event.Properties.Count -gt 0) {
+        # 4625 / 4771 / 4776 layouts are stable enough to index
+        switch ($id) {
+            4625 {
+                # Index mapping is version-dependent; XML is safer if this breaks
+                # Fallback to XML if we can't safely map
+                $FastMode = $false
+            }
+            default {
+                $FastMode = $false
+            }
+        }
+    }
+
+    if (-not $FastMode) {
+        $xml = [xml]$Event.ToXml()
+        foreach ($d in $xml.Event.EventData.Data) {
+            $data[$d.Name] = [string]$d.'#text'
+        }
+    }
+
+    switch ($id) {
+        4625 {
+            $acct = $data.TargetUserName
+            $dom  = $data.TargetDomainName
+            $logonTypeNum = $data.LogonType
+            [int]$ltNum = 0
+            if (-not [int]::TryParse($logonTypeNum, [ref]$ltNum)) { $ltNum = 0 }
+            $ltMeaning = if ($ltNum -ne 0 -and $logonTypeMap.ContainsKey($ltNum)) { $logonTypeMap[$ltNum] } else { $logonTypeNum }
+
+            $status = $data.Status
+            $sub    = $data.SubStatus
+
+            return [pscustomobject]@{
+                DC               = $DcName
+                TimeCreated      = $Event.TimeCreated
+                EventId          = 4625
+                Account          = if ($dom) { "$dom\$acct" } else { $acct }
+                LogonType        = $ltNum
+                LogonTypeMeaning = $ltMeaning
+                Status           = $status
+                StatusMeaning    = if ($status -and $ntStatusMap.ContainsKey($status)) { $ntStatusMap[$status] } else { $null }
+                SubStatus        = $sub
+                SubStatusMeaning = if ($sub -and $ntStatusMap.ContainsKey($sub)) { $ntStatusMap[$sub] } else { $null }
+                FailureCode      = $null
+                FailureCodeMeaning = $null
+                AuthPackage      = $data.AuthenticationPackageName
+                WorkstationName  = $data.WorkstationName
+                SourceIp         = $data.IpAddress
+                SourcePort       = $data.IpPort
+            }
+        }
+
+        4771 {
+            $acct = $data.TargetUserName
+            $dom  = $data.TargetDomainName
+            $code = $data.FailureCode
+
+            return [pscustomobject]@{
+                DC               = $DcName
+                TimeCreated      = $Event.TimeCreated
+                EventId          = 4771
+                Account          = if ($dom) { "$dom\$acct" } else { $acct }
+                LogonType        = $null
+                LogonTypeMeaning = $null
+                Status           = $null
+                StatusMeaning    = $null
+                SubStatus        = $null
+                SubStatusMeaning = $null
+                FailureCode      = $code
+                FailureCodeMeaning = if ($code -and $kerbMap.ContainsKey($code)) { $kerbMap[$code] } else { $null }
+                AuthPackage      = 'Kerberos'
+                WorkstationName  = $data.Workstation
+                SourceIp         = $data.IpAddress
+                SourcePort       = $null
+            }
+        }
+
+        4776 {
+            $acct = $data.TargetUserName
+            $dom  = $data.TargetDomainName
+            $status = $data.Status
+
+            return [pscustomobject]@{
+                DC               = $DcName
+                TimeCreated      = $Event.TimeCreated
+                EventId          = 4776
+                Account          = if ($dom) { "$dom\$acct" } else { $acct }
+                LogonType        = $null
+                LogonTypeMeaning = $null
+                Status           = $status
+                StatusMeaning    = if ($status -and $ntStatusMap.ContainsKey($status)) { $ntStatusMap[$status] } else { $null }
+                SubStatus        = $null
+                SubStatusMeaning = $null
+                FailureCode      = $null
+                FailureCodeMeaning = $null
+                AuthPackage      = 'NTLM'
+                WorkstationName  = $data.Workstation
+                SourceIp         = $null
+                SourcePort       = $null
+            }
+        }
+    }
+}
+
+function Parse-4625Local {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][System.Diagnostics.Eventing.Reader.EventRecord]$Event,
+        [switch]$FastMode
+    )
+
+    $logonTypeMap = Get-LogonTypeMap
+    $ntStatusMap  = Get-NtStatusMap
+
+    $data = @{}
+
+    if (-not $FastMode) {
+        $xml = [xml]$Event.ToXml()
+        foreach ($d in $xml.Event.EventData.Data) { $data[$d.Name] = [string]$d.'#text' }
+    } else {
+        $xml = [xml]$Event.ToXml()
+        foreach ($d in $xml.Event.EventData.Data) { $data[$d.Name] = [string]$d.'#text' }
+    }
+
+    $acct = $data.TargetUserName
+    $dom  = $data.TargetDomainName
+    $logonTypeNum = $data.LogonType
+    [int]$ltNum = 0
+    if (-not [int]::TryParse($logonTypeNum, [ref]$ltNum)) { $ltNum = 0 }
+    $ltMeaning = if ($ltNum -ne 0 -and $logonTypeMap.ContainsKey($ltNum)) { $logonTypeMap[$ltNum] } else { $logonTypeNum }
+
+    $status = $data.Status
+    $sub    = $data.SubStatus
+
+    [pscustomobject]@{
+        TimeCreated      = $Event.TimeCreated
+        EventId          = 4625
+        Account          = if ($dom) { "$dom\$acct" } else { $acct }
+        LogonType        = $ltNum
+        LogonTypeMeaning = $ltMeaning
+        Status           = $status
+        StatusMeaning    = if ($status -and $ntStatusMap.ContainsKey($status)) { $ntStatusMap[$status] } else { $null }
+        SubStatus        = $sub
+        SubStatusMeaning = if ($sub -and $ntStatusMap.ContainsKey($sub)) { $ntStatusMap[$sub] } else { $null }
+        AuthPackage      = $data.AuthenticationPackageName
+        WorkstationName  = $data.WorkstationName
+        SourceIp         = $data.IpAddress
+        SourcePort       = $data.IpPort
+        ProcessName      = $data.ProcessName
+    }
+}
+
+function Render-EventRowDomain {
+    param($e)
+
+    $t  = Safe-Html ($e.TimeCreated.ToString("yyyy-MM-dd HH:mm:ss"))
+    $dc = Safe-Html $e.DC
+    $id = $e.EventId
+    $acct = Safe-Html $e.Account
+
+    $statusStr = if ($null -ne $e.StatusMeaning) { $e.StatusMeaning } else { '' }
+    $subStatusStr = if ($null -ne $e.SubStatusMeaning) { $e.SubStatusMeaning } else { '' }
+    $failureCodeStr = if ($null -ne $e.FailureCodeMeaning) { $e.FailureCodeMeaning } else { '' }
+
+    $lt = if ($e.LogonType) { Safe-Html ("{0} ({1})" -f $e.LogonType, $e.LogonTypeMeaning) } else { "" }
+    $st = if ($e.Status) { Safe-Html ("{0} {1}" -f $e.Status, $statusStr) } else { "" }
+    $ss = if ($e.SubStatus) { Safe-Html ("{0} {1}" -f $e.SubStatus, $subStatusStr) } else { "" }
+    $fc = if ($e.FailureCode) { Safe-Html ("{0} {1}" -f $e.FailureCode, $failureCodeStr) } else { "" }
+
+    $src = if ($e.SourceIp) { Safe-Html $e.SourceIp } else { "" }
+    $ws  = Safe-Html $e.WorkstationName
+    $ap  = Safe-Html $e.AuthPackage
+
+    "<tr><td>$t</td><td class='mono'>$dc</td><td>$id</td><td class='mono'>$acct</td><td>$lt</td><td class='mono'>$st</td><td class='mono'>$ss</td><td class='mono'>$fc</td><td class='mono'>$src</td><td class='mono'>$ws</td><td class='mono'>$ap</td></tr>"
+}
+
+function Render-EventRowLocal {
+    param($e)
+
+    $t = Safe-Html ($e.TimeCreated.ToString("yyyy-MM-dd HH:mm:ss"))
+    $acct = Safe-Html $e.Account
+    $lt = Safe-Html ("{0} ({1})" -f $e.LogonType, $e.LogonTypeMeaning)
+    $statusStr = if ($null -ne $e.StatusMeaning) { $e.StatusMeaning } else { '' }
+    $subStatusStr = if ($null -ne $e.SubStatusMeaning) { $e.SubStatusMeaning } else { '' }
+    $st = Safe-Html ("{0} {1}" -f $e.Status, $statusStr)
+    $ss = Safe-Html ("{0} {1}" -f $e.SubStatus, $subStatusStr)
+    $src = Safe-Html ("{0}:{1}" -f $e.SourceIp, $e.SourcePort)
+    $ws  = Safe-Html $e.WorkstationName
+    $ap  = Safe-Html $e.AuthPackage
+
+    "<tr><td>$t</td><td class='mono'>$acct</td><td>$lt</td><td class='mono'>$st</td><td class='mono'>$ss</td><td class='mono'>$src</td><td class='mono'>$ws</td><td class='mono'>$ap</td></tr>"
+}
+
+Export-ModuleMember -Function *-*
