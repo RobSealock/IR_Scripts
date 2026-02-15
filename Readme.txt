@@ -17,6 +17,14 @@ C. Get-DomainLogons.ps1 - Consulidates accross DCs logons
 
 D. LocalLogons.ps1 - logons on the local machine
 
-E. Invoke-IRLocalTriage.ps1 - start of LoTL scanning script (work in progress)
+E. Account Failures - Test script, DC logs and local log review 
+AuthEventParser.psm1
+AuthExport.psm1
+AuthHeuristics.psm1
+DC-FailedLogons-Report.ps1
+Local-FailedLogons-Report.ps1
+Test-DCLogAccess.ps1
+
+F. Invoke-IRLocalTriage.ps1 - start of LoTL scanning script (work in progress)
 
 
