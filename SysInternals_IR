@@ -1,0 +1,34 @@
+Process & Memory Analysis
+Tool	IR Use Cases
+Process Explorer	Identify suspicious processes, parent/child anomalies, unsigned DLLs, injected modules, network connections, service hosting abuse
+Process Monitor (ProcMon)	Real‑time tracing of file/registry/process activity, persistence creation, malware behavior, config writes, credential theft indicators
+RAMMap	Detect abnormal memory usage, large allocations, ransomware staging, memory leaks
+VMMap	Inspect per‑process memory layout, detect injected code, RWX pages, suspicious memory regions
+PsList	Lightweight process listing, hidden process detection, cross‑checking with other tools
+Network & Remote Activity
+Tool	IR Use Cases
+TCPView	Identify C2 connections, suspicious ports, process‑to‑socket mapping, beaconing behavior
+PsPing	Validate connectivity to suspicious hosts, measure latency during LM investigations
+PsExec	Investigate remote execution artifacts, replicate attacker behavior, remote triage collection
+Persistence & Autostart Analysis
+Tool	IR Use Cases
+Autoruns	Comprehensive persistence sweep: Run keys, services, drivers, tasks, WMI, BHOs, AppInit DLLs, COM hijacks; export for offline review
+PsService	Enumerate services, detect malicious service creation, identify service hijacking
+File System & Disk Forensics
+Tool	IR Use Cases
+SigCheck	Verify signatures, detect unsigned/tampered binaries, hash files, check VirusTotal reputation, detect timestomping
+Streams	Identify Alternate Data Streams (ADS), detect hidden payloads or metadata
+SDelete	Securely wipe malicious files post‑containment, detect attacker attempts at secure deletion
+Disk2vhd	Create VHD snapshots for offline forensic analysis, preserve evidence safely
+System State & Environment Analysis
+Tool	IR Use Cases
+Sysmon	High‑fidelity logging: process creation, network connections, registry changes, driver loads, WMI events, file creation
+PsInfo	Collect OS metadata, installed patches, uptime, system configuration — useful for scoping
+PsLoggedOn	Identify interactive/remote logons, detect lateral movement, validate suspicious account activity
+Malware & Behavior Analysis
+Tool	IR Use Cases
+Strings	Extract strings from binaries, find C2 URLs, commands, embedded configs, malware hints
+SigCheck	(Also used here) PE metadata, version anomalies, reputation checks
+Rootkit & Stealth Technique Detection
+Tool	IR Use Cases
+RootkitRevealer	Detect hidden files/registry keys, API vs raw disk discrepancies, kernel‑level rootkits
