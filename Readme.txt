@@ -27,6 +27,8 @@ Test-DCLogAccess.ps1
 
 F. Invoke-IRLocalTriage.ps1 - start of LoTL scanning script (work in progress)
 
+G. Invoke-SysinternalsIR.ps1 - uses the Sysinternal Tools for capture 
+
 
 External IR Tools
 https://docs.velociraptor.app/downloads/
