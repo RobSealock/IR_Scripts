@@ -28,3 +28,17 @@ Test-DCLogAccess.ps1
 F. Invoke-IRLocalTriage.ps1 - start of LoTL scanning script (work in progress)
 
 
+External IR Tools
+https://docs.velociraptor.app/downloads/
+    Velociraptor is an advanced digital forensic and incident response tool that enhances your visibility into your endpoints.
+#
+https://www.kroll.com/en/services/cyber/incident-response-recovery/kroll-artifact-parser-and-extractor-kape
+https://tryhackme.com/room/kape
+https://medium.com/@jcm3/kape-tryhackme-walkthrough-800b4c9175e6
+#
+https://github.com/Gerenios/AADInternals
+#
+Sysinternals TCPView
+Sysinternals Autoruns
+
+
