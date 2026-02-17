@@ -1,0 +1,338 @@
+<#
+How Too Use:
+# Full sweep
+.\Invoke-SysinternalsIR.ps1 -SysinternalsPath "C:\Tools\Sysinternals" -OutputRoot "C:\IR\Sysinternals" -RunAll
+
+# Only Autoruns + TCPView
+.\Invoke-SysinternalsIR.ps1 -SysinternalsPath "C:\Tools\Sysinternals" -OutputRoot "C:\IR\Sysinternals" -Autoruns -TcpView
+#>
+<#
+.SYNOPSIS
+    Sysinternals IR Orchestrator – runs selected Sysinternals tools and exports CSV, JSON, and HTML.
+
+.DESCRIPTION
+    - Focuses on CLI-capable Sysinternals tools commonly used in IR.
+    - Uses CSV output where supported, then normalizes to JSON and HTML.
+    - Deterministic folder structure and filenames for repeatable triage.
+
+    Tools covered (assuming they exist in -SysinternalsPath):
+        - autorunsc.exe   (Autoruns CLI)
+        - sigcheck.exe
+        - tcpvcon.exe     (TCPView CLI)
+        - pslist.exe
+        - psinfo.exe
+        - psloggedon.exe
+        - psservice.exe
+
+.PARAMETER SysinternalsPath
+    Folder containing Sysinternals executables.
+
+.PARAMETER OutputRoot
+    Root folder for all outputs. A timestamped subfolder is created inside.
+
+.PARAMETER RunAll
+    Run all supported tools.
+
+.PARAMETER Autoruns, Sigcheck, TcpView, PsList, PsInfo, PsLoggedOn, PsService
+    Run individual tools (can be combined). If none specified and -RunAll is not set, defaults to -RunAll.
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateScript({ Test-Path $_ -PathType 'Container' })]
+    [string]$SysinternalsPath,
+
+    [Parameter(Mandatory = $true)]
+    [string]$OutputRoot,
+
+    [switch]$RunAll,
+
+    [switch]$Autoruns,
+    [switch]$Sigcheck,
+    [switch]$TcpView,
+    [switch]$PsList,
+    [switch]$PsInfo,
+    [switch]$PsLoggedOn,
+    [switch]$PsService
+)
+
+#region Helper Functions
+
+function New-DeterministicOutputRoot {
+    param(
+        [string]$BasePath
+    )
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $root = Join-Path $BasePath "Sysinternals_IR_$timestamp"
+    New-Item -Path $root -ItemType Directory -Force | Out-Null
+    return $root
+}
+
+function New-ToolOutputFolder {
+    param(
+        [string]$Root,
+        [string]$ToolName
+    )
+    $path = Join-Path $Root $ToolName
+    New-Item -Path $path -ItemType Directory -Force | Out-Null
+    return $path
+}
+
+function Invoke-SysinternalsTool {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ExePath,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutputFolder,
+
+        [Parameter(Mandatory = $true)]
+        [string]$BaseName,
+
+        [switch]$IsCsvOutput
+    )
+
+    if (-not (Test-Path $ExePath -PathType Leaf)) {
+        Write-Warning "Executable not found: $ExePath"
+        return
+    }
+
+    $rawPath  = Join-Path $OutputFolder "$BaseName.raw.txt"
+    $csvPath  = Join-Path $OutputFolder "$BaseName.csv"
+    $jsonPath = Join-Path $OutputFolder "$BaseName.json"
+    $htmlPath = Join-Path $OutputFolder "$BaseName.html"
+
+    Write-Verbose "Running: `"$ExePath`" $($Arguments -join ' ')"
+
+    try {
+        if ($IsCsvOutput) {
+            # Direct CSV output
+            & $ExePath @Arguments 2>&1 | Out-File -FilePath $csvPath -Encoding UTF8
+            Copy-Item $csvPath $rawPath -Force
+
+            $data = @()
+            try {
+                $data = Import-Csv -Path $csvPath
+            } catch {
+                Write-Warning "Failed to Import-Csv from $csvPath. Writing raw only. $_"
+            }
+
+            if ($data -and $data.Count -gt 0) {
+                $data | ConvertTo-Json -Depth 6 | Out-File -FilePath $jsonPath -Encoding UTF8
+                $data | ConvertTo-Html -Title $BaseName | Out-File -FilePath $htmlPath -Encoding UTF8
+            }
+        }
+        else {
+            # Plain text output only
+            & $ExePath @Arguments 2>&1 | Out-File -FilePath $rawPath -Encoding UTF8
+
+            # Wrap raw lines into simple objects for JSON/HTML
+            $lines = Get-Content -Path $rawPath
+            $data = $lines | ForEach-Object {
+                [pscustomobject]@{
+                    Line = $_
+                }
+            }
+
+            if ($data -and $data.Count -gt 0) {
+                $data | ConvertTo-Json -Depth 3 | Out-File -FilePath $jsonPath -Encoding UTF8
+                $data | ConvertTo-Html -Title $BaseName | Out-File -FilePath $htmlPath -Encoding UTF8
+            }
+        }
+    }
+    catch {
+        Write-Warning "Error running $ExePath: $_"
+    }
+}
+
+#endregion Helper Functions
+
+#region Tool Wrappers
+
+function Invoke-AutorunsIR {
+    param(
+        [string]$SysinternalsPath,
+        [string]$RootOutput
+    )
+
+    $toolName = 'Autoruns'
+    $folder   = New-ToolOutputFolder -Root $RootOutput -ToolName $toolName
+    $exe      = Join-Path $SysinternalsPath 'autorunsc.exe'
+
+    $args = @(
+        '-accepteula',
+        '-a', '*',      # all locations
+        '-c'            # CSV output
+    )
+
+    Invoke-SysinternalsTool -ExePath $exe -Arguments $args -OutputFolder $folder -BaseName $toolName -IsCsvOutput
+}
+
+function Invoke-SigcheckIR {
+    param(
+        [string]$SysinternalsPath,
+        [string]$RootOutput
+    )
+
+    $toolName = 'Sigcheck'
+    $folder   = New-ToolOutputFolder -Root $RootOutput -ToolName $toolName
+    $exe      = Join-Path $SysinternalsPath 'sigcheck.exe'
+
+    # Example: scan system32; adjust as needed or parameterize
+    $targetPath = "$env:SystemRoot\System32"
+
+    $args = @(
+        '-accepteula',
+        '-h',           # show hashes
+        '-c',           # CSV
+        $targetPath
+    )
+
+    Invoke-SysinternalsTool -ExePath $exe -Arguments $args -OutputFolder $folder -BaseName $toolName -IsCsvOutput
+}
+
+function Invoke-TcpViewIR {
+    param(
+        [string]$SysinternalsPath,
+        [string]$RootOutput
+    )
+
+    $toolName = 'TcpView'
+    $folder   = New-ToolOutputFolder -Root $RootOutput -ToolName $toolName
+    $exe      = Join-Path $SysinternalsPath 'tcpvcon.exe'   # CLI version
+
+    $args = @(
+        '-accepteula',
+        '-c'            # CSV
+    )
+
+    Invoke-SysinternalsTool -ExePath $exe -Arguments $args -OutputFolder $folder -BaseName $toolName -IsCsvOutput
+}
+
+function Invoke-PsListIR {
+    param(
+        [string]$SysinternalsPath,
+        [string]$RootOutput
+    )
+
+    $toolName = 'PsList'
+    $folder   = New-ToolOutputFolder -Root $RootOutput -ToolName $toolName
+    $exe      = Join-Path $SysinternalsPath 'pslist.exe'
+
+    # pslist has no native CSV, so we capture text
+    $args = @(
+        '-accepteula',
+        '-nobanner'
+    )
+
+    Invoke-SysinternalsTool -ExePath $exe -Arguments $args -OutputFolder $folder -BaseName $toolName
+}
+
+function Invoke-PsInfoIR {
+    param(
+        [string]$SysinternalsPath,
+        [string]$RootOutput
+    )
+
+    $toolName = 'PsInfo'
+    $folder   = New-ToolOutputFolder -Root $RootOutput -ToolName $toolName
+    $exe      = Join-Path $SysinternalsPath 'psinfo.exe'
+
+    $args = @(
+        '-accepteula',
+        '-nobanner'
+    )
+
+    Invoke-SysinternalsTool -ExePath $exe -Arguments $args -OutputFolder $folder -BaseName $toolName
+}
+
+function Invoke-PsLoggedOnIR {
+    param(
+        [string]$SysinternalsPath,
+        [string]$RootOutput
+    )
+
+    $toolName = 'PsLoggedOn'
+    $folder   = New-ToolOutputFolder -Root $RootOutput -ToolName $toolName
+    $exe      = Join-Path $SysinternalsPath 'psloggedon.exe'
+
+    $args = @(
+        '-accepteula'
+    )
+
+    Invoke-SysinternalsTool -ExePath $exe -Arguments $args -OutputFolder $folder -BaseName $toolName
+}
+
+function Invoke-PsServiceIR {
+    param(
+        [string]$SysinternalsPath,
+        [string]$RootOutput
+    )
+
+    $toolName = 'PsService'
+    $folder   = New-ToolOutputFolder -Root $RootOutput -ToolName $toolName
+    $exe      = Join-Path $SysinternalsPath 'psservice.exe'
+
+    $args = @(
+        '-accepteula',
+        'enum'
+    )
+
+    Invoke-SysinternalsTool -ExePath $exe -Arguments $args -OutputFolder $folder -BaseName $toolName
+}
+
+#endregion Tool Wrappers
+
+#region Main
+
+# Default to RunAll if nothing else specified
+if (-not ($RunAll -or $Autoruns -or $Sigcheck -or $TcpView -or $PsList -or $PsInfo -or $PsLoggedOn -or $PsService)) {
+    $RunAll = $true
+}
+
+$resolvedOutputRoot = New-DeterministicOutputRoot -BasePath $OutputRoot
+Write-Host "Sysinternals IR output root: $resolvedOutputRoot"
+
+if ($RunAll -or $Autoruns) {
+    Write-Host "[*] Running Autoruns..."
+    Invoke-AutorunsIR -SysinternalsPath $SysinternalsPath -RootOutput $resolvedOutputRoot
+}
+
+if ($RunAll -or $Sigcheck) {
+    Write-Host "[*] Running Sigcheck..."
+    Invoke-SigcheckIR -SysinternalsPath $SysinternalsPath -RootOutput $resolvedOutputRoot
+}
+
+if ($RunAll -or $TcpView) {
+    Write-Host "[*] Running TcpView (tcpvcon)..."
+    Invoke-TcpViewIR -SysinternalsPath $SysinternalsPath -RootOutput $resolvedOutputRoot
+}
+
+if ($RunAll -or $PsList) {
+    Write-Host "[*] Running PsList..."
+    Invoke-PsListIR -SysinternalsPath $SysinternalsPath -RootOutput $resolvedOutputRoot
+}
+
+if ($RunAll -or $PsInfo) {
+    Write-Host "[*] Running PsInfo..."
+    Invoke-PsInfoIR -SysinternalsPath $SysinternalsPath -RootOutput $resolvedOutputRoot
+}
+
+if ($RunAll -or $PsLoggedOn) {
+    Write-Host "[*] Running PsLoggedOn..."
+    Invoke-PsLoggedOnIR -SysinternalsPath $SysinternalsPath -RootOutput $resolvedOutputRoot
+}
+
+if ($RunAll -or $PsService) {
+    Write-Host "[*] Running PsService..."
+    Invoke-PsServiceIR -SysinternalsPath $SysinternalsPath -RootOutput $resolvedOutputRoot
+}
+
+Write-Host "Completed Sysinternals IR collection."
+
+#endregion Main
